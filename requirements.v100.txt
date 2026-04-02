@@ -1,0 +1,9 @@
+accelerate==1.13.0
+datasets==4.8.4
+peft==0.18.1
+transformers==5.4.0
+trl==1.0.0
+opencv-python==4.13.0.92
+imageio-ffmpeg==0.6.0
+pillow==12.2.0
+av==14.4.0
