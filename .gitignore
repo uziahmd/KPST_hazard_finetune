@@ -1,0 +1,31 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.env
+_tmp_*/
+results/
+*.ipynb_checkpoints
+
+# Ignore all .zip files
+*.zip
+
+# Ignore folders ending with _vids
+*_vids/
+
+# Ignore a specific folder named 'videos'
+videos/
+
+# Ignore folders starting with _tmp
+_tmp*/
+
+# Ignore folders starting with 'videos'
+videos*/
+.ipynb_checkpoints/
+dataset/images/
+hf_models/
+tmp_*/
+
+# Additional data folders
+data/
+vlm_dataset/

@@ -1,0 +1,300 @@
+{
+  "config": {
+    "data_dir": "data",
+    "prompt_file": "prompt.txt",
+    "out_dir": "vlm_dataset",
+    "clip_sec": 5.0,
+    "stride_sec": 1.0,
+    "anchor_sec": 1.0,
+    "anchor_consensus_thr": 0.7,
+    "test_ratio_target": 0.2,
+    "include_evidence": false,
+    "recompute_hazard": true,
+    "keep_ambiguous_in_export": false,
+    "easy_negative_keep_prob_train": 0.2,
+    "extract_clips": true
+  },
+  "overall_summary_all": {
+    "num_samples": 1281,
+    "num_stable": 1245,
+    "num_ambiguous": 36,
+    "num_positive": 56,
+    "num_positive_stable": 53,
+    "hazard_present_distribution": {
+      "no": 1225,
+      "yes": 56
+    },
+    "label_signature_distribution": {
+      "no_hazard|no|no_forklift|no_forklift|none": 891,
+      "no_hazard|no|outside|moving|away": 127,
+      "no_hazard|no|inside|moving|away": 89,
+      "no_hazard|no|inside|stationary|none": 81,
+      "no_hazard|no|outside|moving|towards": 28,
+      "unsafe_forklift_approach|yes|inside|moving|towards": 56,
+      "no_hazard|no|outside|stationary|none": 9
+    },
+    "hard_negative_distribution": {
+      "no_forklift": 891,
+      "other_no_hazard": 136,
+      "inside_moving_away": 89,
+      "inside_stationary": 81,
+      "outside_moving_towards": 28
+    }
+  },
+  "overall_summary_export_train": {
+    "num_samples": 442,
+    "num_stable": 442,
+    "num_ambiguous": 0,
+    "num_positive": 40,
+    "num_positive_stable": 40,
+    "hazard_present_distribution": {
+      "no": 402,
+      "yes": 40
+    },
+    "label_signature_distribution": {
+      "no_hazard|no|no_forklift|no_forklift|none": 142,
+      "no_hazard|no|outside|moving|away": 99,
+      "no_hazard|no|inside|moving|away": 66,
+      "no_hazard|no|inside|stationary|none": 79,
+      "no_hazard|no|outside|moving|towards": 8,
+      "unsafe_forklift_approach|yes|inside|moving|towards": 40,
+      "no_hazard|no|outside|stationary|none": 8
+    },
+    "hard_negative_distribution": {
+      "no_forklift": 142,
+      "other_no_hazard": 107,
+      "inside_moving_away": 66,
+      "inside_stationary": 79,
+      "outside_moving_towards": 8
+    }
+  },
+  "overall_summary_export_test": {
+    "num_samples": 207,
+    "num_stable": 207,
+    "num_ambiguous": 0,
+    "num_positive": 13,
+    "num_positive_stable": 13,
+    "hazard_present_distribution": {
+      "no": 194,
+      "yes": 13
+    },
+    "label_signature_distribution": {
+      "no_hazard|no|no_forklift|no_forklift|none": 147,
+      "no_hazard|no|outside|moving|towards": 15,
+      "unsafe_forklift_approach|yes|inside|moving|towards": 13,
+      "no_hazard|no|inside|moving|away": 20,
+      "no_hazard|no|outside|moving|away": 11,
+      "no_hazard|no|inside|stationary|none": 1
+    },
+    "hard_negative_distribution": {
+      "no_forklift": 147,
+      "outside_moving_towards": 15,
+      "inside_moving_away": 20,
+      "other_no_hazard": 11,
+      "inside_stationary": 1
+    }
+  },
+  "split_selection": {
+    "score": 0.11404515741156346,
+    "test_ratio_actual": 0.16626506024096385,
+    "test_num_stable": 207,
+    "train_num_stable": 1038,
+    "test_positive": 13,
+    "train_positive": 40,
+    "test_videos": [
+      "동일유리02_S20250716164500_E20250716164839"
+    ],
+    "train_videos": [
+      "금진Camera05_S20251213073941_E20251213074740",
+      "금진Camera05_S20251213082156_E20251213083037",
+      "동일유리02_S20250716113905_E20250716114050"
+    ],
+    "test_hazard_present_distribution": {
+      "no": 194,
+      "yes": 13
+    },
+    "test_label_signature_distribution": {
+      "no_hazard|no|no_forklift|no_forklift|none": 147,
+      "no_hazard|no|outside|moving|towards": 15,
+      "unsafe_forklift_approach|yes|inside|moving|towards": 13,
+      "no_hazard|no|inside|moving|away": 20,
+      "no_hazard|no|outside|moving|away": 11,
+      "no_hazard|no|inside|stationary|none": 1
+    },
+    "test_hard_negative_distribution": {
+      "no_forklift": 147,
+      "outside_moving_towards": 15,
+      "inside_moving_away": 20,
+      "other_no_hazard": 11,
+      "inside_stationary": 1
+    }
+  },
+  "per_video": {
+    "금진Camera05_S20251213073941_E20251213074740": {
+      "video_path": "data/금진Camera05_S20251213073941_E20251213074740.mp4",
+      "annotation_path": "data/금진Camera05_S20251213073941_E20251213074740.json",
+      "video_meta": {
+        "fps": 15.151547093757445,
+        "frame_count": 7187,
+        "duration_sec": 474.34099999999995
+      },
+      "annotation_stats": {
+        "annotation_frames": 7187,
+        "annotation_count_derived_fps_x1000": 15152,
+        "positive_frames": 257
+      },
+      "clip_summary": {
+        "num_samples": 470,
+        "num_stable": 457,
+        "num_ambiguous": 13,
+        "num_positive": 17,
+        "num_positive_stable": 15,
+        "hazard_present_distribution": {
+          "no": 453,
+          "yes": 17
+        },
+        "label_signature_distribution": {
+          "no_hazard|no|no_forklift|no_forklift|none": 350,
+          "no_hazard|no|outside|moving|away": 30,
+          "no_hazard|no|inside|moving|away": 29,
+          "no_hazard|no|inside|stationary|none": 40,
+          "no_hazard|no|outside|moving|towards": 4,
+          "unsafe_forklift_approach|yes|inside|moving|towards": 17
+        },
+        "hard_negative_distribution": {
+          "no_forklift": 350,
+          "other_no_hazard": 30,
+          "inside_moving_away": 29,
+          "inside_stationary": 40,
+          "outside_moving_towards": 4
+        }
+      }
+    },
+    "금진Camera05_S20251213082156_E20251213083037": {
+      "video_path": "data/금진Camera05_S20251213082156_E20251213083037.mp4",
+      "annotation_path": "data/금진Camera05_S20251213082156_E20251213083037.json",
+      "video_meta": {
+        "fps": 15.151544515656402,
+        "frame_count": 7818,
+        "duration_sec": 515.987
+      },
+      "annotation_stats": {
+        "annotation_frames": 7818,
+        "annotation_count_derived_fps_x1000": 15152,
+        "positive_frames": 282
+      },
+      "clip_summary": {
+        "num_samples": 511,
+        "num_stable": 495,
+        "num_ambiguous": 16,
+        "num_positive": 19,
+        "num_positive_stable": 18,
+        "hazard_present_distribution": {
+          "no": 492,
+          "yes": 19
+        },
+        "label_signature_distribution": {
+          "no_hazard|no|no_forklift|no_forklift|none": 329,
+          "no_hazard|no|outside|moving|towards": 4,
+          "unsafe_forklift_approach|yes|inside|moving|towards": 19,
+          "no_hazard|no|inside|stationary|none": 40,
+          "no_hazard|no|inside|moving|away": 36,
+          "no_hazard|no|outside|moving|away": 74,
+          "no_hazard|no|outside|stationary|none": 9
+        },
+        "hard_negative_distribution": {
+          "no_forklift": 329,
+          "outside_moving_towards": 4,
+          "inside_stationary": 40,
+          "inside_moving_away": 36,
+          "other_no_hazard": 83
+        }
+      }
+    },
+    "동일유리02_S20250716113905_E20250716114050": {
+      "video_path": "data/동일유리02_S20250716113905_E20250716114050.mp4",
+      "annotation_path": "data/동일유리02_S20250716113905_E20250716114050.json",
+      "video_meta": {
+        "fps": 15.151678199016432,
+        "frame_count": 1408,
+        "duration_sec": 92.927
+      },
+      "annotation_stats": {
+        "annotation_frames": 1408,
+        "annotation_count_derived_fps_x1000": 15152,
+        "positive_frames": 107
+      },
+      "clip_summary": {
+        "num_samples": 88,
+        "num_stable": 86,
+        "num_ambiguous": 2,
+        "num_positive": 7,
+        "num_positive_stable": 7,
+        "hazard_present_distribution": {
+          "no": 81,
+          "yes": 7
+        },
+        "label_signature_distribution": {
+          "no_hazard|no|outside|moving|towards": 4,
+          "unsafe_forklift_approach|yes|inside|moving|towards": 7,
+          "no_hazard|no|no_forklift|no_forklift|none": 64,
+          "no_hazard|no|inside|moving|away": 4,
+          "no_hazard|no|outside|moving|away": 9
+        },
+        "hard_negative_distribution": {
+          "outside_moving_towards": 4,
+          "no_forklift": 64,
+          "inside_moving_away": 4,
+          "other_no_hazard": 9
+        }
+      }
+    },
+    "동일유리02_S20250716164500_E20250716164839": {
+      "video_path": "data/동일유리02_S20250716164500_E20250716164839.mp4",
+      "annotation_path": "data/동일유리02_S20250716164500_E20250716164839.json",
+      "video_meta": {
+        "fps": 15.086355905250494,
+        "frame_count": 3273,
+        "duration_sec": 216.951
+      },
+      "annotation_stats": {
+        "annotation_frames": 3273,
+        "annotation_count_derived_fps_x1000": 15086,
+        "positive_frames": 194
+      },
+      "clip_summary": {
+        "num_samples": 212,
+        "num_stable": 207,
+        "num_ambiguous": 5,
+        "num_positive": 13,
+        "num_positive_stable": 13,
+        "hazard_present_distribution": {
+          "no": 199,
+          "yes": 13
+        },
+        "label_signature_distribution": {
+          "no_hazard|no|no_forklift|no_forklift|none": 148,
+          "no_hazard|no|outside|moving|towards": 16,
+          "unsafe_forklift_approach|yes|inside|moving|towards": 13,
+          "no_hazard|no|inside|moving|away": 20,
+          "no_hazard|no|outside|moving|away": 14,
+          "no_hazard|no|inside|stationary|none": 1
+        },
+        "hard_negative_distribution": {
+          "no_forklift": 148,
+          "outside_moving_towards": 16,
+          "inside_moving_away": 20,
+          "other_no_hazard": 14,
+          "inside_stationary": 1
+        }
+      }
+    }
+  },
+  "output_files": {
+    "all_clips_manifest": "vlm_dataset/all_clips_manifest.jsonl",
+    "train_manifest": "vlm_dataset/train_manifest.jsonl",
+    "test_manifest": "vlm_dataset/test_manifest.jsonl",
+    "train_chat": "vlm_dataset/train_chat.jsonl",
+    "test_chat": "vlm_dataset/test_chat.jsonl"
+  }
+}

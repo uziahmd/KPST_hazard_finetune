@@ -1,0 +1,26 @@
+[
+  {
+    "manifest_path": "vlm_dataset/all_clips_manifest.jsonl",
+    "num_rows": 1281,
+    "num_clean": 1281,
+    "num_with_violations": 0,
+    "violation_counts": {},
+    "example_rows": {}
+  },
+  {
+    "manifest_path": "vlm_dataset/train_manifest.jsonl",
+    "num_rows": 442,
+    "num_clean": 442,
+    "num_with_violations": 0,
+    "violation_counts": {},
+    "example_rows": {}
+  },
+  {
+    "manifest_path": "vlm_dataset/test_manifest.jsonl",
+    "num_rows": 207,
+    "num_clean": 207,
+    "num_with_violations": 0,
+    "violation_counts": {},
+    "example_rows": {}
+  }
+]
