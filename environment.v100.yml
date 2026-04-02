@@ -9,7 +9,9 @@ dependencies:
   - pip
   - cmake>=3.25
   - ffmpeg
-  - pyarrow
+  - pyarrow>=21
+  - pandas
+  - datasets=4.8.4
   - av
   - pytorch=2.5.1
   - torchvision=0.20.1
