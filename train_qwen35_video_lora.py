@@ -287,13 +287,22 @@ def load_model_and_processor(args: argparse.Namespace, dtype: torch.dtype):
         trust_remote_code=True,
     )
 
-    # Video frame resolution fed to the vision encoder.
-    # Qwen2.5-VL uses 28×28 patches; 448px = 16 patches per side (reasonable).
-    # The original values (2048*32*32*2 ≈ 4M px) were a unit-confusion bug
-    # that caused enormous memory use and very slow processing on V100.
+    # ── Video frame resolution ────────────────────────────────────────────────
+    # Source clips: ~1280×720 CCTV @ 15fps.
+    # Qwen2.5-VL vision encoder uses 28×28 px patches, so dimensions must be
+    # multiples of 28 for clean tiling.
+    #
+    # PRIMARY (V100 32GB + 4-bit + 12 frames + gradient checkpointing):
+    #   longest_edge = 560  →  20 patches × 28px  →  good spatial detail
+    #   shortest_edge = None →  auto-scale to preserve 16:9 aspect ratio
+    #                           (720/1280 × 560 ≈ 315px → rounds to 308px = 11 patches)
+    #
+    # OOM FALLBACK — swap in if you hit CUDA OOM (saves ~30% VRAM):
+    #   longest_edge = 448  →  16 patches × 28px
+    #   shortest_edge = None
     processor.video_processor.size = {
-        "longest_edge": 448,
-        "shortest_edge": 224,
+        "longest_edge": 560,   # ← change to 448 if OOM
+        "shortest_edge": None, # auto-scale shorter side, prevents distortion
     }
     quantization_config = None
     if args.load_in_4bit:
