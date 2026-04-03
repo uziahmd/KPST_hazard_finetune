@@ -13,14 +13,18 @@ What this script does
       input  = contiguous raw video clip (default: 5s)
       target = state over the final anchor interval (default: last 1s)
 6. Flags ambiguous / transition-heavy windows.
-7. Creates a leakage-safe train/test split at the SOURCE-VIDEO level.
+7. Creates a leakage-safe train/val/test split at the SOURCE-VIDEO level.
+   Both val and test are held-out from distinct source videos to prevent
+   any temporal or distribution leakage.
 8. Extracts raw MP4 clips with ffmpeg.
 9. Writes:
       - all_clips_manifest.jsonl    (full canonical manifest)
       - train_manifest.jsonl        (stable exported train samples)
-      - test_manifest.jsonl         (stable exported test samples)
+      - val_manifest.jsonl          (stable exported val samples, for eval during training)
+      - test_manifest.jsonl         (stable exported test samples, for final evaluation)
       - train_chat.jsonl            (raw-video chat format for fine-tuning)
-      - test_chat.jsonl             (raw-video chat format for evaluation)
+      - val_chat.jsonl              (raw-video chat format for in-training evaluation)
+      - test_chat.jsonl             (raw-video chat format for final evaluation)
       - split_report.json           (summary + chosen video-level split)
 
 Expected input layout
@@ -187,7 +191,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stride-sec", type=float, default=1.0, help="Sliding window stride in seconds.")
     parser.add_argument("--anchor-sec", type=float, default=1.0, help="Anchor interval at end of each clip used for labeling.")
     parser.add_argument("--anchor-consensus-thr", type=float, default=0.70, help="Minimum anchor-mode fraction required for a stable label.")
+    parser.add_argument("--val-ratio", type=float, default=0.15, help="Desired proportion of stable clips assigned to validation, via video-level split.")
     parser.add_argument("--test-ratio", type=float, default=0.20, help="Desired proportion of stable clips assigned to test, via video-level split.")
+    parser.add_argument("--min-val-videos", type=int, default=1, help="Minimum number of source videos in the val split.")
+    parser.add_argument("--max-val-videos", type=int, default=None, help="Maximum number of source videos in the val split.")
     parser.add_argument("--min-test-videos", type=int, default=1, help="Minimum number of source videos in the test split.")
     parser.add_argument("--max-test-videos", type=int, default=None, help="Maximum number of source videos in the test split.")
     parser.add_argument("--keep-ambiguous", action="store_true", help="Keep ambiguous clips in exported train/test manifests instead of only the full manifest.")
@@ -728,12 +735,65 @@ def summarize_samples(samples: Sequence[ClipSample]) -> Dict:
     }
 
 
-def choose_video_level_split(
+def _score_split_subset(
+    subset_samples: List[ClipSample],
+    remainder_samples: List[ClipSample],
+    total_stable: int,
+    target_ratio: float,
+    global_hazard_dist: Dict[str, float],
+    global_sig_dist: Dict[str, float],
+    global_hn_dist: Dict[str, float],
+) -> float:
+    """Compute a split quality score (lower is better)."""
+    ratio_actual = len(subset_samples) / max(total_stable, 1)
+    sub_hazard_dist = normalize_counter(Counter(s.target.hazard_present for s in subset_samples))
+    sub_sig_dist = normalize_counter(Counter(s.label_signature for s in subset_samples))
+    sub_hn_dist = normalize_counter(Counter(s.hard_negative_bucket for s in subset_samples if s.hard_negative_bucket))
+
+    score = 0.0
+    score += 2.0 * abs(ratio_actual - target_ratio)
+    score += 1.5 * js_divergence(global_hazard_dist, sub_hazard_dist)
+    score += 1.0 * js_divergence(global_sig_dist, sub_sig_dist)
+    if global_hn_dist:
+        score += 0.5 * js_divergence(global_hn_dist, sub_hn_dist)
+
+    sub_pos = sum(1 for s in subset_samples if s.target.hazard_present == "yes")
+    rem_pos = sum(1 for s in remainder_samples if s.target.hazard_present == "yes")
+    if sub_pos == 0:
+        score += 5.0
+    if rem_pos == 0:
+        score += 20.0
+
+    sub_hn_buckets = {s.hard_negative_bucket for s in subset_samples if s.hard_negative_bucket}
+    score += 0.2 * len(IMPORTANT_HARD_NEGATIVE_BUCKETS - sub_hn_buckets)
+    return score
+
+
+def choose_video_level_three_way_split(
     samples: Sequence[ClipSample],
+    val_ratio: float,
     test_ratio: float,
+    min_val_videos: int,
+    max_val_videos: Optional[int],
     min_test_videos: int,
     max_test_videos: Optional[int],
-) -> Tuple[set, Dict]:
+) -> Tuple[set, set, Dict]:
+    """
+    Choose a leakage-safe train/val/test split at the source-video level.
+
+    Strategy:
+      1. Pick the test videos first (exhaustive search over video subsets).
+      2. From the remaining videos, pick val videos (exhaustive search).
+      3. Everything else is train.
+
+    Both val and test are optimised independently for label-distribution
+    match and positive-sample presence.
+
+    Returns:
+        chosen_val_videos  – set of source_video_id strings assigned to val
+        chosen_test_videos – set of source_video_id strings assigned to test
+        split_info         – dict with split statistics
+    """
     stable_samples = [s for s in samples if not s.is_ambiguous]
     by_video: Dict[str, List[ClipSample]] = defaultdict(list)
     for s in stable_samples:
@@ -741,73 +801,106 @@ def choose_video_level_split(
 
     videos = sorted(by_video.keys())
     n = len(videos)
-    if n < 2:
-        raise ValueError("Need at least 2 source videos for a train/test split.")
+    if n < 3:
+        raise ValueError(
+            f"Need at least 3 source videos for a train/val/test split (found {n}). "
+            "Lower --min-val-videos / --min-test-videos or add more source videos."
+        )
 
     if max_test_videos is None:
-        max_test_videos = max(min_test_videos, n - 1)
-    max_test_videos = min(max_test_videos, n - 1)
+        max_test_videos = max(min_test_videos, n - 2)
+    max_test_videos = min(max_test_videos, n - 2)  # leave room for val + train
+
+    if max_val_videos is None:
+        max_val_videos = max(min_val_videos, n - 2)
 
     global_hazard_dist = normalize_counter(Counter(s.target.hazard_present for s in stable_samples))
     global_sig_dist = normalize_counter(Counter(s.label_signature for s in stable_samples))
     global_hn_dist = normalize_counter(Counter(s.hard_negative_bucket for s in stable_samples if s.hard_negative_bucket))
     total_stable = len(stable_samples)
 
-    best_subset = None
-    best_score = float("inf")
-    best_info = {}
+    # ── Step 1: choose test videos ────────────────────────────────────────────
+    best_test_subset: Optional[set] = None
+    best_test_score = float("inf")
 
     for r in range(min_test_videos, max_test_videos + 1):
         for subset in itertools.combinations(videos, r):
-            subset = set(subset)
-            test_samples = [s for s in stable_samples if s.source_video_id in subset]
-            train_samples = [s for s in stable_samples if s.source_video_id not in subset]
-            if not test_samples or not train_samples:
+            subset_set = set(subset)
+            test_s = [s for s in stable_samples if s.source_video_id in subset_set]
+            remainder_s = [s for s in stable_samples if s.source_video_id not in subset_set]
+            if not test_s or len(remainder_s) < min_val_videos + 1:
+                continue  # need at least min_val_videos left for val + 1 for train
+            score = _score_split_subset(
+                test_s, remainder_s, total_stable, test_ratio,
+                global_hazard_dist, global_sig_dist, global_hn_dist,
+            )
+            if score < best_test_score:
+                best_test_score = score
+                best_test_subset = subset_set
+
+    if best_test_subset is None:
+        raise RuntimeError("Failed to find a valid video-level test split.")
+    assert best_test_subset is not None  # satisfies type checker
+
+    # ── Step 2: from the remaining videos, choose val videos ──────────────────
+    remaining_videos = sorted(set(videos) - best_test_subset)
+    remaining_stable = [s for s in stable_samples if s.source_video_id in set(remaining_videos)]
+
+    # Recompute global dists over the non-test pool for fair val scoring.
+    rem_hazard_dist = normalize_counter(Counter(s.target.hazard_present for s in remaining_stable))
+    rem_sig_dist = normalize_counter(Counter(s.label_signature for s in remaining_stable))
+    rem_hn_dist = normalize_counter(Counter(s.hard_negative_bucket for s in remaining_stable if s.hard_negative_bucket))
+    total_remaining = len(remaining_stable)
+
+    effective_val_ratio = val_ratio / max(1.0 - float(test_ratio), 1e-6)  # ratio within remaining
+
+    best_val_subset: Optional[set] = None
+    best_val_score = float("inf")
+    effective_max_val = min(max_val_videos, len(remaining_videos) - 1)
+
+    for r in range(min_val_videos, effective_max_val + 1):
+        for subset in itertools.combinations(remaining_videos, r):
+            subset_set = set(subset)
+            val_s = [s for s in remaining_stable if s.source_video_id in subset_set]
+            train_s = [s for s in remaining_stable if s.source_video_id not in subset_set]
+            if not val_s or not train_s:
                 continue
+            score = _score_split_subset(
+                val_s, train_s, total_remaining, effective_val_ratio,
+                rem_hazard_dist, rem_sig_dist, rem_hn_dist,
+            )
+            if score < best_val_score:
+                best_val_score = score
+                best_val_subset = subset_set
 
-            test_ratio_actual = len(test_samples) / max(total_stable, 1)
-            test_hazard_dist = normalize_counter(Counter(s.target.hazard_present for s in test_samples))
-            test_sig_dist = normalize_counter(Counter(s.label_signature for s in test_samples))
-            test_hn_dist = normalize_counter(Counter(s.hard_negative_bucket for s in test_samples if s.hard_negative_bucket))
+    if best_val_subset is None:
+        raise RuntimeError("Failed to find a valid video-level val split.")
+    assert best_val_subset is not None  # satisfies type checker
 
-            score = 0.0
-            score += 2.0 * abs(test_ratio_actual - test_ratio)
-            score += 1.5 * js_divergence(global_hazard_dist, test_hazard_dist)
-            score += 1.0 * js_divergence(global_sig_dist, test_sig_dist)
-            if global_hn_dist:
-                score += 0.5 * js_divergence(global_hn_dist, test_hn_dist)
+    # ── Step 3: assemble info dict ────────────────────────────────────────────
+    test_s = [s for s in stable_samples if s.source_video_id in best_test_subset]
+    val_s = [s for s in stable_samples if s.source_video_id in best_val_subset]
+    train_s = [s for s in stable_samples if s.source_video_id not in best_test_subset | best_val_subset]
 
-            test_pos = sum(1 for s in test_samples if s.target.hazard_present == "yes")
-            train_pos = sum(1 for s in train_samples if s.target.hazard_present == "yes")
-            if test_pos == 0:
-                score += 5.0
-            if train_pos == 0:
-                score += 20.0
-
-            test_hn_buckets = {s.hard_negative_bucket for s in test_samples if s.hard_negative_bucket}
-            missing_important = len(IMPORTANT_HARD_NEGATIVE_BUCKETS - test_hn_buckets)
-            score += 0.2 * missing_important
-
-            if score < best_score:
-                best_score = score
-                best_subset = subset
-                best_info = {
-                    "score": score,
-                    "test_ratio_actual": test_ratio_actual,
-                    "test_num_stable": len(test_samples),
-                    "train_num_stable": len(train_samples),
-                    "test_positive": test_pos,
-                    "train_positive": train_pos,
-                    "test_videos": sorted(subset),
-                    "train_videos": sorted(set(videos) - subset),
-                    "test_hazard_present_distribution": dict(Counter(s.target.hazard_present for s in test_samples)),
-                    "test_label_signature_distribution": dict(Counter(s.label_signature for s in test_samples)),
-                    "test_hard_negative_distribution": dict(Counter(s.hard_negative_bucket for s in test_samples if s.hard_negative_bucket)),
-                }
-
-    if best_subset is None:
-        raise RuntimeError("Failed to find a valid video-level train/test split.")
-    return best_subset, best_info
+    split_info = {
+        "test_score": best_test_score,
+        "val_score": best_val_score,
+        "test_ratio_actual": len(test_s) / max(total_stable, 1),
+        "val_ratio_actual": len(val_s) / max(total_stable, 1),
+        "train_num_stable": len(train_s),
+        "val_num_stable": len(val_s),
+        "test_num_stable": len(test_s),
+        "train_positive": sum(1 for s in train_s if s.target.hazard_present == "yes"),
+        "val_positive": sum(1 for s in val_s if s.target.hazard_present == "yes"),
+        "test_positive": sum(1 for s in test_s if s.target.hazard_present == "yes"),
+        "train_videos": sorted(set(videos) - best_test_subset - best_val_subset),
+        "val_videos": sorted(best_val_subset),
+        "test_videos": sorted(best_test_subset),
+        "train_hazard_present_distribution": dict(Counter(s.target.hazard_present for s in train_s)),
+        "val_hazard_present_distribution": dict(Counter(s.target.hazard_present for s in val_s)),
+        "test_hazard_present_distribution": dict(Counter(s.target.hazard_present for s in test_s)),
+    }
+    return best_val_subset, best_test_subset, split_info
 
 
 def ffmpeg_exists() -> bool:
@@ -930,25 +1023,36 @@ def main() -> None:
     if not all_samples:
         raise SystemExit("No clip samples were generated.")
 
-    chosen_test_videos, split_info = choose_video_level_split(
+    chosen_val_videos, chosen_test_videos, split_info = choose_video_level_three_way_split(
         all_samples,
+        val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
+        min_val_videos=args.min_val_videos,
+        max_val_videos=args.max_val_videos,
         min_test_videos=args.min_test_videos,
         max_test_videos=args.max_test_videos,
     )
 
     for s in all_samples:
-        s.split = "test" if s.source_video_id in chosen_test_videos else "train"
+        if s.source_video_id in chosen_test_videos:
+            s.split = "test"
+        elif s.source_video_id in chosen_val_videos:
+            s.split = "val"
+        else:
+            s.split = "train"
 
     exportable = all_samples if args.keep_ambiguous else [s for s in all_samples if not s.is_ambiguous]
     train_samples = [s for s in exportable if s.split == "train"]
-    test_samples = [s for s in exportable if s.split == "test"]
+    val_samples   = [s for s in exportable if s.split == "val"]
+    test_samples  = [s for s in exportable if s.split == "test"]
 
+    # Easy-negative downsampling only on train — never on val/test so
+    # evaluation distributions stay representative.
     train_samples = maybe_downsample_easy_negatives_train(train_samples, keep_prob=args.easy_negative_keep_prob)
 
     if args.extract_clips:
         clips_root = out_dir / "clips"
-        for s in train_samples + test_samples:
+        for s in train_samples + val_samples + test_samples:
             split_dir = clips_root / s.split / s.source_video_id
             dst_clip = split_dir / f"{s.sample_id}.mp4"
             extract_clip_ffmpeg(
@@ -959,12 +1063,14 @@ def main() -> None:
             )
             s.clip_path = str(dst_clip)
 
-    all_manifest_path = out_dir / "all_clips_manifest.jsonl"
+    all_manifest_path   = out_dir / "all_clips_manifest.jsonl"
     train_manifest_path = out_dir / "train_manifest.jsonl"
-    test_manifest_path = out_dir / "test_manifest.jsonl"
-    train_chat_path = out_dir / "train_chat.jsonl"
-    test_chat_path = out_dir / "test_chat.jsonl"
-    split_report_path = out_dir / "split_report.json"
+    val_manifest_path   = out_dir / "val_manifest.jsonl"
+    test_manifest_path  = out_dir / "test_manifest.jsonl"
+    train_chat_path     = out_dir / "train_chat.jsonl"
+    val_chat_path       = out_dir / "val_chat.jsonl"
+    test_chat_path      = out_dir / "test_chat.jsonl"
+    split_report_path   = out_dir / "split_report.json"
 
     write_jsonl(
         all_manifest_path,
@@ -975,12 +1081,20 @@ def main() -> None:
         [clip_sample_to_manifest_row(s, include_evidence=args.include_evidence) for s in train_samples],
     )
     write_jsonl(
+        val_manifest_path,
+        [clip_sample_to_manifest_row(s, include_evidence=args.include_evidence) for s in val_samples],
+    )
+    write_jsonl(
         test_manifest_path,
         [clip_sample_to_manifest_row(s, include_evidence=args.include_evidence) for s in test_samples],
     )
     write_jsonl(
         train_chat_path,
         [clip_sample_to_chat_row(s, prompt_text=prompt_text, include_evidence=args.include_evidence) for s in train_samples],
+    )
+    write_jsonl(
+        val_chat_path,
+        [clip_sample_to_chat_row(s, prompt_text=prompt_text, include_evidence=args.include_evidence) for s in val_samples],
     )
     write_jsonl(
         test_chat_path,
@@ -996,6 +1110,7 @@ def main() -> None:
             "stride_sec": args.stride_sec,
             "anchor_sec": args.anchor_sec,
             "anchor_consensus_thr": args.anchor_consensus_thr,
+            "val_ratio_target": args.val_ratio,
             "test_ratio_target": args.test_ratio,
             "include_evidence": args.include_evidence,
             "recompute_hazard": args.recompute_hazard,
@@ -1005,26 +1120,39 @@ def main() -> None:
         },
         "overall_summary_all": summarize_samples(all_samples),
         "overall_summary_export_train": summarize_samples(train_samples),
+        "overall_summary_export_val": summarize_samples(val_samples),
         "overall_summary_export_test": summarize_samples(test_samples),
         "split_selection": split_info,
         "per_video": per_video_report,
         "output_files": {
             "all_clips_manifest": str(all_manifest_path),
             "train_manifest": str(train_manifest_path),
+            "val_manifest": str(val_manifest_path),
             "test_manifest": str(test_manifest_path),
             "train_chat": str(train_chat_path),
+            "val_chat": str(val_chat_path),
             "test_chat": str(test_chat_path),
         },
     }
     split_report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print("\nDone.")
-    print(f"  All manifest : {all_manifest_path}")
-    print(f"  Train manifest: {train_manifest_path}")
-    print(f"  Test manifest : {test_manifest_path}")
+    print(f"  All manifest  : {all_manifest_path}")
+    print(f"  Train manifest: {train_manifest_path}  ({len(train_samples)} samples)")
+    print(f"  Val manifest  : {val_manifest_path}   ({len(val_samples)} samples)")
+    print(f"  Test manifest : {test_manifest_path}  ({len(test_samples)} samples)")
     print(f"  Train chat    : {train_chat_path}")
+    print(f"  Val chat      : {val_chat_path}")
     print(f"  Test chat     : {test_chat_path}")
     print(f"  Split report  : {split_report_path}")
+    print()
+    print("Split summary:")
+    print(f"  Train : {split_info['train_num_stable']} stable clips from {len(split_info['train_videos'])} video(s)")
+    print(f"          positives={split_info['train_positive']}, distribution={split_info['train_hazard_present_distribution']}")
+    print(f"  Val   : {split_info['val_num_stable']} stable clips from {len(split_info['val_videos'])} video(s)")
+    print(f"          positives={split_info['val_positive']}, distribution={split_info['val_hazard_present_distribution']}")
+    print(f"  Test  : {split_info['test_num_stable']} stable clips from {len(split_info['test_videos'])} video(s)")
+    print(f"          positives={split_info['test_positive']}, distribution={split_info['test_hazard_present_distribution']}")
 
 
 if __name__ == "__main__":

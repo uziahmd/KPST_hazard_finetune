@@ -69,7 +69,10 @@ from transformers import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="LoRA fine-tuning for Qwen 3.5 9B on raw-video chat JSONL.")
     parser.add_argument("--train_file", type=str, default="vlm_dataset/train_chat.jsonl")
-    parser.add_argument("--test_file", type=str, default="vlm_dataset/test_chat.jsonl")
+    parser.add_argument("--val_file",   type=str, default="vlm_dataset/val_chat.jsonl",
+                        help="Validation chat JSONL (produced by data_gen.py). Used for "
+                             "eval_strategy=epoch. Pass empty string to disable.")
+    parser.add_argument("--test_file",  type=str, default="vlm_dataset/test_chat.jsonl")
     parser.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen3.5-9B")
     parser.add_argument("--output_dir", type=str, default="runs/qwen35_9b_video_lora")
 
@@ -80,10 +83,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    parser.add_argument("--num_train_epochs", type=float, default=3.0)
-    parser.add_argument("--learning_rate", type=float, default=2e-4)
+    parser.add_argument("--num_train_epochs", type=float, default=5.0)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--warmup_ratio", type=float, default=0.03)
+    parser.add_argument("--warmup_ratio", type=float, default=0.10)
 
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_strategy", type=str, default="epoch", choices=["no", "steps", "epoch"])
@@ -93,7 +96,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_total_limit", type=int, default=2)
 
     parser.add_argument("--seed", type=int, default=3407)
-    parser.add_argument("--attn_implementation", type=str, default="sdpa")
+    parser.add_argument("--attn_implementation", type=str, default="eager",
+                        help="Use 'eager' on V100 (no Flash Attn). Use 'flash_attention_2' on A100+.")
     parser.add_argument("--gradient_checkpointing", action="store_true")
 
     parser.add_argument("--load_in_4bit", action="store_true", help="Recommended for single-GPU LoRA.")
@@ -106,8 +110,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lora_target_modules",
         type=str,
-        default="all-linear",
-        help='Use "all-linear" or a comma-separated list such as q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj',
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+        help='Comma-separated list of modules to target with LoRA. '
+             'Use "all-linear" to target every linear layer (aggressive on small datasets). '
+             'Default targets only the LLM decoder layers, leaving the vision encoder unchanged.',
     )
 
     parser.add_argument("--report_to", type=str, default="none")
@@ -160,10 +166,14 @@ def apply_chat_template_video_safe(
     num_frames: Optional[int],
     padding: bool = False,
 ):
-    processor_kwargs = {}
+    # All processor-specific and video-specific kwargs must go inside
+    # processor_kwargs to avoid the "Kwargs passed to processor.__call__
+    # have to be in processor_kwargs dict" warning introduced in newer
+    # transformers versions.
+    processor_kwargs: Dict[str, Any] = {
+        "enable_thinking": False,
+    }
     if num_frames is not None:
-        # Pass video-specific args only through processor_kwargs.
-        # Do not also pass fps here.
         processor_kwargs["num_frames"] = num_frames
 
     return processor.apply_chat_template(
@@ -172,30 +182,12 @@ def apply_chat_template_video_safe(
         tokenize=tokenize,
         return_dict=return_dict,
         return_tensors=return_tensors,
-        enable_thinking=False,
         processor_kwargs=processor_kwargs,
         padding=padding,
-        truncation=False,   # critical fix
+        truncation=False,
     )
-    if max_length is not None:
-        base_kwargs["max_length"] = max_length
-
-    if num_frames is not None:
-        try:
-            return processor.apply_chat_template(
-                conversation,
-                processor_kwargs={"num_frames": num_frames, "fps": None},
-                **base_kwargs,
-            )
-        except TypeError:
-            return processor.apply_chat_template(
-                conversation,
-                num_frames=num_frames,
-                fps=None,
-                **base_kwargs,
-            )
-
-    return processor.apply_chat_template(conversation, **base_kwargs)
+    # NOTE: Lines below were unreachable dead code (after the return above).
+    # Removed to avoid confusion.
 
 
 class RawVideoChatCollator:
@@ -268,20 +260,25 @@ class RawVideoChatCollator:
         return full_batch
 
 
-def load_datasets(train_file: str, test_file: str):
+def load_datasets(train_file: str, val_file: str, test_file: str):
     if not os.path.exists(train_file):
         raise FileNotFoundError(f"Train file not found: {train_file}")
     if not os.path.exists(test_file):
         raise FileNotFoundError(f"Test file not found: {test_file}")
 
-    dataset = load_dataset(
-        "json",
-        data_files={
-            "train": train_file,
-            "test": test_file,
-        },
-    )
-    return dataset
+    data_files: Dict[str, str] = {
+        "train": train_file,
+        "test": test_file,
+    }
+
+    has_val = val_file and os.path.exists(val_file)
+    if val_file and not has_val:
+        print(f"[WARN] val_file not found: {val_file} — evaluation during training will be disabled.")
+    if has_val:
+        data_files["val"] = val_file
+
+    dataset = load_dataset("json", data_files=data_files)
+    return dataset, has_val
 
 
 def load_model_and_processor(args: argparse.Namespace, dtype: torch.dtype):
@@ -290,9 +287,13 @@ def load_model_and_processor(args: argparse.Namespace, dtype: torch.dtype):
         trust_remote_code=True,
     )
 
+    # Video frame resolution fed to the vision encoder.
+    # Qwen2.5-VL uses 28×28 patches; 448px = 16 patches per side (reasonable).
+    # The original values (2048*32*32*2 ≈ 4M px) were a unit-confusion bug
+    # that caused enormous memory use and very slow processing on V100.
     processor.video_processor.size = {
-        "longest_edge": 2048 * 32 * 32 * 2,
-        "shortest_edge": 256 * 32 * 32 * 2,
+        "longest_edge": 448,
+        "shortest_edge": 224,
     }
     quantization_config = None
     if args.load_in_4bit:
@@ -335,10 +336,15 @@ def load_model_and_processor(args: argparse.Namespace, dtype: torch.dtype):
     )
 
     model = get_peft_model(model, lora_config)
-    model.config.use_cache = True
 
     if args.gradient_checkpointing:
+        # use_cache is incompatible with gradient checkpointing.
+        # Setting it True here and letting the Trainer override it with a
+        # warning is confusing — set it correctly up front.
+        model.config.use_cache = False
         model.gradient_checkpointing_enable()
+    else:
+        model.config.use_cache = True
 
     model.print_trainable_parameters()
     return model, processor
@@ -362,7 +368,9 @@ def make_training_arguments(args: argparse.Namespace, dtype: torch.dtype) -> Tra
         "bf16": dtype == torch.bfloat16,
         "fp16": dtype == torch.float16,
         "remove_unused_columns": False,
-        "dataloader_num_workers": 0,
+        # >0 workers allow video I/O to overlap GPU compute.
+        # Keep at 2 for V100 where host RAM is the bottleneck.
+        "dataloader_num_workers": 2,
         "gradient_checkpointing": args.gradient_checkpointing,
         "label_names": ["labels"],
         "report_to": [] if args.report_to == "none" else args.report_to,
@@ -453,10 +461,12 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
 
     dtype = select_dtype(args)
-    dataset = load_datasets(args.train_file, args.test_file)
+    dataset, has_val = load_datasets(args.train_file, args.val_file, args.test_file)
 
     print(f"Train samples: {len(dataset['train'])}")
-    print(f"Test samples:  {len(dataset['test'])}")
+    if has_val:
+        print(f"Val samples  : {len(dataset['val'])}")
+    print(f"Test samples : {len(dataset['test'])}")
 
     model, processor = load_model_and_processor(args, dtype)
     collator = RawVideoChatCollator(
@@ -466,11 +476,18 @@ def main() -> None:
 
     training_args = make_training_arguments(args, dtype)
 
+    # Use val split for in-training eval when available.
+    # Test split is reserved for final post-training evaluation only.
+    eval_ds = dataset["val"] if has_val and args.eval_strategy != "no" else None
+    if eval_ds is None and args.eval_strategy != "no":
+        print("[WARN] eval_strategy is set but no val set is available — disabling eval.")
+        args.eval_strategy = "no"
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=dataset["train"],
-        eval_dataset=dataset["test"] if args.eval_strategy != "no" else None,
+        eval_dataset=eval_ds,
         data_collator=collator,
     )
 
