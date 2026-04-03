@@ -168,18 +168,18 @@ def apply_chat_template_video_safe(
     truncation: bool = False,
     max_length: Optional[int] = None,
 ):
-    # ALL processor / tokenizer kwargs must go inside processor_kwargs to
-    # avoid the "Kwargs passed to processor.__call__ have to be in
-    # processor_kwargs dict" warning in newer transformers versions.
-    # The top-level apply_chat_template forwards **kwargs → __call__(),
-    # which rejects anything not in its explicit signature.
+    # processor_kwargs go to processor.__call__() for video/image/tokenizer
+    # processing.  enable_thinking is a TEMPLATE parameter (controls the
+    # Jinja chat template), so it stays top-level on apply_chat_template.
     processor_kwargs: Dict[str, Any] = {
-        "enable_thinking": False,
         "padding": padding,
         "truncation": truncation,
     }
     if num_frames is not None:
         processor_kwargs["num_frames"] = num_frames
+        # Qwen3 VL's sample_frames() rejects getting BOTH num_frames and fps.
+        # The processor ships with a default fps, so we must clear it.
+        processor_kwargs["fps"] = None
     if max_length is not None:
         processor_kwargs["max_length"] = max_length
 
@@ -189,10 +189,9 @@ def apply_chat_template_video_safe(
         tokenize=tokenize,
         return_dict=return_dict,
         return_tensors=return_tensors,
+        enable_thinking=enable_thinking,
         processor_kwargs=processor_kwargs,
     )
-    # NOTE: Lines below were unreachable dead code (after the return above).
-    # Removed to avoid confusion.
 
 
 class RawVideoChatCollator:
