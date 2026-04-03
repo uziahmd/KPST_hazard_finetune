@@ -165,16 +165,23 @@ def apply_chat_template_video_safe(
     enable_thinking: bool,
     num_frames: Optional[int],
     padding: bool = False,
+    truncation: bool = False,
+    max_length: Optional[int] = None,
 ):
-    # All processor-specific and video-specific kwargs must go inside
-    # processor_kwargs to avoid the "Kwargs passed to processor.__call__
-    # have to be in processor_kwargs dict" warning introduced in newer
-    # transformers versions.
+    # ALL processor / tokenizer kwargs must go inside processor_kwargs to
+    # avoid the "Kwargs passed to processor.__call__ have to be in
+    # processor_kwargs dict" warning in newer transformers versions.
+    # The top-level apply_chat_template forwards **kwargs → __call__(),
+    # which rejects anything not in its explicit signature.
     processor_kwargs: Dict[str, Any] = {
         "enable_thinking": False,
+        "padding": padding,
+        "truncation": truncation,
     }
     if num_frames is not None:
         processor_kwargs["num_frames"] = num_frames
+    if max_length is not None:
+        processor_kwargs["max_length"] = max_length
 
     return processor.apply_chat_template(
         conversation,
@@ -183,8 +190,6 @@ def apply_chat_template_video_safe(
         return_dict=return_dict,
         return_tensors=return_tensors,
         processor_kwargs=processor_kwargs,
-        padding=padding,
-        truncation=False,
     )
     # NOTE: Lines below were unreachable dead code (after the return above).
     # Removed to avoid confusion.
