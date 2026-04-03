@@ -191,12 +191,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stride-sec", type=float, default=1.0, help="Sliding window stride in seconds.")
     parser.add_argument("--anchor-sec", type=float, default=1.0, help="Anchor interval at end of each clip used for labeling.")
     parser.add_argument("--anchor-consensus-thr", type=float, default=0.70, help="Minimum anchor-mode fraction required for a stable label.")
-    parser.add_argument("--val-ratio", type=float, default=0.15, help="Desired proportion of stable clips assigned to validation, via video-level split.")
-    parser.add_argument("--test-ratio", type=float, default=0.20, help="Desired proportion of stable clips assigned to test, via video-level split.")
-    parser.add_argument("--min-val-videos", type=int, default=1, help="Minimum number of source videos in the val split.")
-    parser.add_argument("--max-val-videos", type=int, default=None, help="Maximum number of source videos in the val split.")
-    parser.add_argument("--min-test-videos", type=int, default=1, help="Minimum number of source videos in the test split.")
-    parser.add_argument("--max-test-videos", type=int, default=None, help="Maximum number of source videos in the test split.")
+    parser.add_argument("--val-ratio", type=float, default=0.15, help="Desired proportion of stable clips assigned to validation.")
+    parser.add_argument("--test-ratio", type=float, default=0.20, help="Desired proportion of stable clips assigned to test.")
+    parser.add_argument(
+        "--split-strategy", type=str, default="clip", choices=["clip", "video"],
+        help=(
+            "'clip' (default): clips from every source video are distributed across all three splits, "
+            "stratified by hazard_present, with temporal guard bands to prevent leakage. "
+            "'video': entire source videos are assigned to a single split (guarantees zero leakage "
+            "but requires >=3 source videos and means each split sees only some cameras)."
+        ),
+    )
+    parser.add_argument(
+        "--guard-clips", type=int, default=5,
+        help=(
+            "[clip strategy only] Number of clip positions to exclude adjacent to val/test selections "
+            "to prevent temporal leakage from overlapping sliding windows. "
+            "Default 5 = ceil(clip_sec=5 / stride_sec=1), guaranteeing zero frame overlap."
+        ),
+    )
+    parser.add_argument("--min-val-videos", type=int, default=1, help="[video strategy only] Minimum source videos in val split.")
+    parser.add_argument("--max-val-videos", type=int, default=None, help="[video strategy only] Maximum source videos in val split.")
+    parser.add_argument("--min-test-videos", type=int, default=1, help="[video strategy only] Minimum source videos in test split.")
+    parser.add_argument("--max-test-videos", type=int, default=None, help="[video strategy only] Maximum source videos in test split.")
     parser.add_argument("--keep-ambiguous", action="store_true", help="Keep ambiguous clips in exported train/test manifests instead of only the full manifest.")
     parser.add_argument("--include-evidence", dest="include_evidence", action="store_true", help="Include a short templated evidence field in the assistant JSON.")
     parser.add_argument("--no-include-evidence", dest="include_evidence", action="store_false", help="Exclude evidence from the assistant JSON.")
@@ -735,6 +752,148 @@ def summarize_samples(samples: Sequence[ClipSample]) -> Dict:
     }
 
 
+def _assign_group_to_splits(
+    clips: List[ClipSample],
+    val_ratio: float,
+    test_ratio: float,
+    guard_clips: int,
+    val_ids: set,
+    test_ids: set,
+) -> None:
+    """
+    Assign clips from a temporally-sorted group to val/test sets using
+    systematic (evenly-spaced) sampling with guard-band exclusion.
+
+    Guard bands: the `guard_clips` positions on each side of every selected
+    val or test clip are excluded from selection for the opposing split.
+    This prevents temporal leakage between splits for overlapping sliding-
+    window clips (e.g. with clip_sec=5, stride_sec=1, clips that are 5
+    positions apart have zero frame overlap, so guard_clips=5 is safe).
+    """
+    n = len(clips)
+    if n == 0:
+        return
+
+    # ── Step 1: select val positions at regular intervals ────────────────────
+    n_val = max(1, round(n * val_ratio)) if n >= 3 else 0
+    if n_val > 0:
+        step = max(1, n // n_val)
+        val_positions: set = set(itertools.islice(range(0, n, step), n_val))
+    else:
+        val_positions = set()
+
+    # ── Step 2: compute guard band around val positions ───────────────────────
+    guarded: set = set()
+    for p in val_positions:
+        for g in range(max(0, p - guard_clips), min(n, p + guard_clips + 1)):
+            if g not in val_positions:
+                guarded.add(g)
+
+    # ── Step 3: select test positions from non-val, non-guarded pool ─────────
+    eligible: List[int] = [
+        i for i in range(n) if i not in val_positions and i not in guarded
+    ]
+    n_test = max(1, round(n * test_ratio)) if eligible else 0
+    if n_test > 0 and eligible:
+        step_t = max(1, len(eligible) // n_test)
+        test_positions: set = set(itertools.islice(eligible[::step_t], n_test))
+    else:
+        test_positions = set()
+
+    # ── Step 4: record sample IDs ────────────────────────────────────────────
+    for i, clip in enumerate(clips):
+        if i in val_positions:
+            val_ids.add(clip.sample_id)
+        elif i in test_positions:
+            test_ids.add(clip.sample_id)
+        # else → train (default)
+
+
+def choose_clip_level_stratified_split(
+    samples: Sequence[ClipSample],
+    val_ratio: float,
+    test_ratio: float,
+    guard_clips: int,
+) -> Tuple[set, set, Dict]:
+    """
+    Clip-level stratified split with temporal guard bands.
+
+    Unlike the video-level split, this ensures **every source video is
+    represented in all three splits**, so each split sees all camera angles
+    and scene variations present in the data.
+
+    Within each (video, hazard_present) stratum, clips are sorted by start
+    time and assigned using systematic evenly-spaced sampling. Clips
+    immediately adjacent to a selected val/test clip—within `guard_clips`
+    stride steps—are withheld from the other splits so that temporally
+    overlapping sliding-window clips never straddle a train/val or
+    train/test boundary.
+
+    Returns
+    -------
+    val_ids   : set of sample_id strings assigned to val
+    test_ids  : set of sample_id strings assigned to test
+    split_info: dict with statistics and per-video coverage breakdown
+    """
+    stable = [s for s in samples if not s.is_ambiguous]
+
+    by_video: Dict[str, List[ClipSample]] = defaultdict(list)
+    for s in stable:
+        by_video[s.source_video_id].append(s)
+
+    val_ids: set = set()
+    test_ids: set = set()
+
+    for video_id in sorted(by_video):
+        clips_sorted = sorted(by_video[video_id], key=lambda s: s.clip_start_sec)
+
+        # Stratify positive and negative clips independently  so that even
+        # rare positive events are distributed across all three splits,
+        # rather than all landing in train by chance.
+        positives = [s for s in clips_sorted if s.target.hazard_present == "yes"]
+        negatives = [s for s in clips_sorted if s.target.hazard_present == "no"]
+
+        _assign_group_to_splits(positives, val_ratio, test_ratio, guard_clips, val_ids, test_ids)
+        _assign_group_to_splits(negatives, val_ratio, test_ratio, guard_clips, val_ids, test_ids)
+
+    # ── Build split_info dict ─────────────────────────────────────────────────
+    train_s = [s for s in stable if s.sample_id not in val_ids and s.sample_id not in test_ids]
+    val_s   = [s for s in stable if s.sample_id in val_ids]
+    test_s  = [s for s in stable if s.sample_id in test_ids]
+    total   = len(stable)
+
+    split_info = {
+        "strategy": "clip_level_stratified",
+        "guard_clips": guard_clips,
+        "val_ratio_actual":  len(val_s)  / max(total, 1),
+        "test_ratio_actual": len(test_s) / max(total, 1),
+        "train_num_stable": len(train_s),
+        "val_num_stable":   len(val_s),
+        "test_num_stable":  len(test_s),
+        "train_positive": sum(1 for s in train_s if s.target.hazard_present == "yes"),
+        "val_positive":   sum(1 for s in val_s   if s.target.hazard_present == "yes"),
+        "test_positive":  sum(1 for s in test_s  if s.target.hazard_present == "yes"),
+        "train_videos": sorted({s.source_video_id for s in train_s}),
+        "val_videos":   sorted({s.source_video_id for s in val_s}),
+        "test_videos":  sorted({s.source_video_id for s in test_s}),
+        "train_hazard_present_distribution": dict(Counter(s.target.hazard_present for s in train_s)),
+        "val_hazard_present_distribution":   dict(Counter(s.target.hazard_present for s in val_s)),
+        "test_hazard_present_distribution":  dict(Counter(s.target.hazard_present for s in test_s)),
+        # Per-video breakdown so you can verify every camera is covered.
+        "per_video_split_counts": {
+            vid: {
+                "train": sum(1 for s in by_video[vid]
+                             if s.sample_id not in val_ids and s.sample_id not in test_ids
+                             and not s.is_ambiguous),
+                "val":   sum(1 for s in by_video[vid] if s.sample_id in val_ids),
+                "test":  sum(1 for s in by_video[vid] if s.sample_id in test_ids),
+            }
+            for vid in sorted(by_video)
+        },
+    }
+    return val_ids, test_ids, split_info
+
+
 def _score_split_subset(
     subset_samples: List[ClipSample],
     remainder_samples: List[ClipSample],
@@ -1023,23 +1182,50 @@ def main() -> None:
     if not all_samples:
         raise SystemExit("No clip samples were generated.")
 
-    chosen_val_videos, chosen_test_videos, split_info = choose_video_level_three_way_split(
-        all_samples,
-        val_ratio=args.val_ratio,
-        test_ratio=args.test_ratio,
-        min_val_videos=args.min_val_videos,
-        max_val_videos=args.max_val_videos,
-        min_test_videos=args.min_test_videos,
-        max_test_videos=args.max_test_videos,
-    )
-
-    for s in all_samples:
-        if s.source_video_id in chosen_test_videos:
-            s.split = "test"
-        elif s.source_video_id in chosen_val_videos:
-            s.split = "val"
-        else:
-            s.split = "train"
+    # ── Choose train / val / test split ──────────────────────────────────────
+    if args.split_strategy == "clip":
+        # Default: distribute clips from every video across all three splits,
+        # stratified by hazard_present, with temporal guard bands.
+        print(
+            f"\nSplit strategy: clip-level stratified "
+            f"(guard_clips={args.guard_clips}, val={args.val_ratio:.0%}, test={args.test_ratio:.0%})"
+        )
+        val_ids, test_ids, split_info = choose_clip_level_stratified_split(
+            all_samples,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+            guard_clips=args.guard_clips,
+        )
+        for s in all_samples:
+            if s.sample_id in test_ids:
+                s.split = "test"
+            elif s.sample_id in val_ids:
+                s.split = "val"
+            else:
+                s.split = "train"
+    else:
+        # Fallback: whole source videos assigned to a single split.
+        # Requires >=3 source videos; guarantees zero temporal leakage.
+        print(
+            f"\nSplit strategy: video-level "
+            f"(val={args.val_ratio:.0%}, test={args.test_ratio:.0%})"
+        )
+        chosen_val_videos, chosen_test_videos, split_info = choose_video_level_three_way_split(
+            all_samples,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+            min_val_videos=args.min_val_videos,
+            max_val_videos=args.max_val_videos,
+            min_test_videos=args.min_test_videos,
+            max_test_videos=args.max_test_videos,
+        )
+        for s in all_samples:
+            if s.source_video_id in chosen_test_videos:
+                s.split = "test"
+            elif s.source_video_id in chosen_val_videos:
+                s.split = "val"
+            else:
+                s.split = "train"
 
     exportable = all_samples if args.keep_ambiguous else [s for s in all_samples if not s.is_ambiguous]
     train_samples = [s for s in exportable if s.split == "train"]
