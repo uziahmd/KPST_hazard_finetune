@@ -289,20 +289,20 @@ def load_model_and_processor(args: argparse.Namespace, dtype: torch.dtype):
 
     # ── Video frame resolution ────────────────────────────────────────────────
     # Source clips: ~1280×720 CCTV @ 15fps.
-    # Qwen2.5-VL vision encoder uses 28×28 px patches, so dimensions must be
-    # multiples of 28 for clean tiling.
+    # Qwen3 VL vision encoder uses 28×28 px patches, so dimensions must be
+    # multiples of 28 for clean tiling. Both keys MUST be present as integers
+    # (the processor raises ValueError if either is None).
     #
     # PRIMARY (V100 32GB + 4-bit + 12 frames + gradient checkpointing):
-    #   longest_edge = 560  →  20 patches × 28px  →  good spatial detail
-    #   shortest_edge = None →  auto-scale to preserve 16:9 aspect ratio
-    #                           (720/1280 × 560 ≈ 315px → rounds to 308px = 11 patches)
+    #   longest_edge  = 560  →  20 patches × 28px
+    #   shortest_edge = 308  →  11 patches × 28px  (preserves ~16:9 ratio)
     #
-    # OOM FALLBACK — swap in if you hit CUDA OOM (saves ~30% VRAM):
-    #   longest_edge = 448  →  16 patches × 28px
-    #   shortest_edge = None
+    # OOM FALLBACK — swap in if you hit CUDA OOM (saves ~30% vision VRAM):
+    #   longest_edge  = 448  →  16 patches × 28px
+    #   shortest_edge = 252  →   9 patches × 28px
     processor.video_processor.size = {
-        "longest_edge": 560,   # ← change to 448 if OOM
-        "shortest_edge": None, # auto-scale shorter side, prevents distortion
+        "longest_edge": 560,    # ← change to 448 if OOM
+        "shortest_edge": 308,   # ← change to 252 if OOM
     }
     quantization_config = None
     if args.load_in_4bit:
