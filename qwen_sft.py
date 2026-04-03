@@ -44,7 +44,7 @@ pip install -U "transformers @ git+https://github.com/huggingface/transformers.g
 pip install -U trl peft accelerate datasets torch torchvision pillow torchcodec
 
 Example:
-python qwen_sft_lora_fp16.py \
+python qwen_sft.py \
   --train_file vlm_dataset/train_chat.jsonl \
   --test_file vlm_dataset/test_chat.jsonl \
   --project_root . \
