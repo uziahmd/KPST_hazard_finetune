@@ -207,7 +207,30 @@ def parse_args() -> argparse.Namespace:
         help=(
             "[clip strategy only] Number of clip positions to exclude adjacent to val/test selections "
             "to prevent temporal leakage from overlapping sliding windows. "
-            "Default 5 = ceil(clip_sec=5 / stride_sec=1), guaranteeing zero frame overlap."
+            "Default 5 = ceil(clip_sec=5 / stride_sec=1), guaranteeing zero frame overlap. "
+            "Applied to negative (no-hazard) clips. See --positive-guard-clips for positives."
+        ),
+    )
+    parser.add_argument(
+        "--positive-test-ratio", type=float, default=0.35,
+        help=(
+            "[clip strategy only] Fraction of positive (hazard=yes) clips assigned to test. "
+            "Higher than --test-ratio because positives are rare: you want enough in test "
+            "to evaluate the model on the hard cases. Default 0.35."
+        ),
+    )
+    parser.add_argument(
+        "--positive-val-ratio", type=float, default=0.20,
+        help=(
+            "[clip strategy only] Fraction of positive clips assigned to val. Default 0.20."
+        ),
+    )
+    parser.add_argument(
+        "--positive-guard-clips", type=int, default=1,
+        help=(
+            "[clip strategy only] Guard band size (in clip positions) around val/test selections "
+            "for POSITIVE clips only. Positive clips are sparse (rare hazard events) so a wide "
+            "guard would consume most of them. Default 1 (just skip immediately adjacent clip)."
         ),
     )
     parser.add_argument("--min-val-videos", type=int, default=1, help="[video strategy only] Minimum source videos in val split.")
@@ -814,6 +837,9 @@ def choose_clip_level_stratified_split(
     val_ratio: float,
     test_ratio: float,
     guard_clips: int,
+    positive_val_ratio: float,
+    positive_test_ratio: float,
+    positive_guard_clips: int,
 ) -> Tuple[set, set, Dict]:
     """
     Clip-level stratified split with temporal guard bands.
@@ -822,12 +848,17 @@ def choose_clip_level_stratified_split(
     represented in all three splits**, so each split sees all camera angles
     and scene variations present in the data.
 
-    Within each (video, hazard_present) stratum, clips are sorted by start
-    time and assigned using systematic evenly-spaced sampling. Clips
-    immediately adjacent to a selected val/test clip—within `guard_clips`
-    stride steps—are withheld from the other splits so that temporally
-    overlapping sliding-window clips never straddle a train/val or
-    train/test boundary.
+    Positive and negative clips are assigned using *separate* sampling
+    parameters:
+
+    - Negatives (no-hazard): use val_ratio / test_ratio / guard_clips.
+      guard_clips=5 prevents leakage between the dense 1s-stride windows.
+
+    - Positives (hazard=yes): use positive_val_ratio / positive_test_ratio /
+      positive_guard_clips.  Positive clips are rare and sparse, so a large
+      guard would silently consume most of them.  A smaller guard (default 1)
+      and a higher test ratio (default 0.35) ensures enough positives reach
+      val and test to make evaluation meaningful.
 
     Returns
     -------
@@ -853,7 +884,11 @@ def choose_clip_level_stratified_split(
         positives = [s for s in clips_sorted if s.target.hazard_present == "yes"]
         negatives = [s for s in clips_sorted if s.target.hazard_present == "no"]
 
-        _assign_group_to_splits(positives, val_ratio, test_ratio, guard_clips, val_ids, test_ids)
+        # Use separate ratios and guard sizes for positives vs negatives.
+        # Negatives are dense (1 clip/sec) → large guard prevents leakage.
+        # Positives are sparse (rare events) → small guard preserves coverage.
+        _assign_group_to_splits(positives, positive_val_ratio, positive_test_ratio,
+                                positive_guard_clips, val_ids, test_ids)
         _assign_group_to_splits(negatives, val_ratio, test_ratio, guard_clips, val_ids, test_ids)
 
     # ── Build split_info dict ─────────────────────────────────────────────────
@@ -864,7 +899,10 @@ def choose_clip_level_stratified_split(
 
     split_info = {
         "strategy": "clip_level_stratified",
-        "guard_clips": guard_clips,
+        "guard_clips_negatives": guard_clips,
+        "guard_clips_positives": positive_guard_clips,
+        "positive_val_ratio_target":  positive_val_ratio,
+        "positive_test_ratio_target": positive_test_ratio,
         "val_ratio_actual":  len(val_s)  / max(total, 1),
         "test_ratio_actual": len(test_s) / max(total, 1),
         "train_num_stable": len(train_s),
@@ -1195,6 +1233,9 @@ def main() -> None:
             val_ratio=args.val_ratio,
             test_ratio=args.test_ratio,
             guard_clips=args.guard_clips,
+            positive_val_ratio=args.positive_val_ratio,
+            positive_test_ratio=args.positive_test_ratio,
+            positive_guard_clips=args.positive_guard_clips,
         )
         for s in all_samples:
             if s.sample_id in test_ids:
