@@ -31,3 +31,4 @@ data/
 vlm_dataset/
 vlm_dataset_v2/
 runs/
+.tmp_*/
