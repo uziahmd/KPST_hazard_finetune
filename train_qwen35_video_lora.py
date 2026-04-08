@@ -37,11 +37,32 @@ Expected row format:
   "meta": {...}
 }
 
-Suggested install base:
-  pip install -U "transformers @ git+https://github.com/huggingface/transformers.git@main"
-  pip install -U datasets accelerate peft trl bitsandbytes
+RUN
 
-Depending on your environment, you may also need a video backend such as torchcodec.
+python train_qwen35_video_lora.py \
+  --train_file vlm_dataset/train_chat.jsonl \
+  --val_file   vlm_dataset/val_chat.jsonl \
+  --test_file  vlm_dataset/test_chat.jsonl \
+  --model_name_or_path Qwen/Qwen3.5-9B \
+  --output_dir runs/qwen35_9b_lora_newprompt \
+  --num_frames 12 \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 8 \
+  --num_train_epochs 12 \
+  --learning_rate 1e-4 \
+  --warmup_ratio 0.10 \
+  --weight_decay 0.01 \
+  --lora_r 16 \
+  --lora_alpha 32 \
+  --lora_dropout 0.05 \
+  --lora_target_modules "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
+  --gradient_checkpointing \
+  --use_fp16 \
+  --eval_strategy epoch \
+  --save_strategy epoch \
+  --save_total_limit 12 \
+  --attn_implementation eager \
+  --seed 3407
 """
 
 import argparse
@@ -350,14 +371,7 @@ def load_model_and_processor(args: argparse.Namespace, dtype: torch.dtype):
 
     model = get_peft_model(model, lora_config)
 
-    if args.gradient_checkpointing:
-        # use_cache is incompatible with gradient checkpointing.
-        # Setting it True here and letting the Trainer override it with a
-        # warning is confusing — set it correctly up front.
-        model.config.use_cache = False
-        model.gradient_checkpointing_enable()
-    else:
-        model.config.use_cache = True
+    model.config.use_cache = False
 
     model.print_trainable_parameters()
     return model, processor

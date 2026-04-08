@@ -73,7 +73,7 @@ Dependencies
 
 Example
 -------
-python build_vlm_video_dataset.py \
+python data_gen.py \
   --data-dir data \
   --prompt-file prompt.txt \
   --out-dir vlm_dataset \
