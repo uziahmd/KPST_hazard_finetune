@@ -40,11 +40,11 @@ Expected row format:
 RUN
 
 python train_qwen35_video_lora.py \
-  --train_file vlm_dataset/train_chat.jsonl \
-  --val_file   vlm_dataset/val_chat.jsonl \
-  --test_file  vlm_dataset/test_chat.jsonl \
+  --train_file vlm_dataset_v2/train_chat.jsonl \
+  --val_file   vlm_dataset_v2/val_chat.jsonl \
+  --test_file  vlm_dataset_v2/test_chat.jsonl \
   --model_name_or_path Qwen/Qwen3.5-9B \
-  --output_dir runs/qwen35_9b_lora_newprompt \
+  --output_dir runs/qwen35_9b_v3 \
   --num_frames 12 \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 8 \
