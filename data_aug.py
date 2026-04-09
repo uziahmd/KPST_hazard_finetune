@@ -10,17 +10,18 @@ import subprocess
 from pathlib import Path
 
 import albumentations as A
+import numpy as np
 
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
 ORIGINAL_JSONL_PATHS = [
-    "vlm_dataset/train_chat.jsonl",
-    "vlm_dataset/val_chat.jsonl",
-    "vlm_dataset/test_chat.jsonl",
+    "vlm_dataset_both/train_chat.jsonl",
+    "vlm_dataset_both/val_chat.jsonl",
+    "vlm_dataset_both/test_chat.jsonl",
 ]
 
-OUTPUT_DIR = "vlm_dataset_v2"
+OUTPUT_DIR = "vlm_dataset_both_aug"
 OUTPUT_VIDEOS_DIR = os.path.join(OUTPUT_DIR, "clips")
 TEMP_DIR = os.path.join(OUTPUT_DIR, "_temp")
 os.makedirs(OUTPUT_VIDEOS_DIR, exist_ok=True)
@@ -32,6 +33,10 @@ RANDOM_SEED = 42
 
 # If True, rewrap unchanged copies with ffmpeg stream copy instead of shutil.copy2
 USE_FFMPEG_FOR_CLEAN_COPY = True
+
+# Create a night-version augmentation only for records whose parsed
+# assistant JSON has zone_relation in {"no_worker", "no_forklift"}
+NIGHT_AUG_ZONE_RELATIONS = {"no_worker", "no_forklift"}
 
 # ==========================================
 # 2. AUGMENTATION SETUP
@@ -125,19 +130,16 @@ def choose_output_codec(src_codec):
         return "libx265"
     if src_codec == "mpeg4":
         return "mpeg4"
-    # safe default for mp4 workflows
     return "libx264"
 
 
 def choose_pixel_format(src_pix_fmt):
-    # Keep original if it's common and supported; otherwise use yuv420p.
     supported_common = {
         "yuv420p", "yuvj420p",
         "yuv422p", "yuv444p",
         "nv12"
     }
     if src_pix_fmt in supported_common:
-        # normalize yuvj420p to yuv420p for compatibility
         if src_pix_fmt == "yuvj420p":
             return "yuv420p"
         return src_pix_fmt
@@ -145,9 +147,6 @@ def choose_pixel_format(src_pix_fmt):
 
 
 def ffmpeg_stream_copy(src_path, dst_path):
-    """
-    Copy original file with ffmpeg using stream copy.
-    """
     cmd = [
         "ffmpeg", "-y",
         "-i", src_path,
@@ -162,10 +161,6 @@ def ffmpeg_stream_copy(src_path, dst_path):
 
 
 def ffmpeg_normalize_augmented(temp_aug_path, src_reference_path, final_out_path):
-    """
-    Re-encode augmented video to be close to the original clip properties.
-    Copies metadata from original where possible.
-    """
     info = ffprobe_video_info(src_reference_path)
 
     src_codec = info["video_codec"]
@@ -175,8 +170,8 @@ def ffmpeg_normalize_augmented(temp_aug_path, src_reference_path, final_out_path
 
     cmd = [
         "ffmpeg", "-y",
-        "-i", temp_aug_path,          # augmented video
-        "-i", src_reference_path,     # original for metadata/audio reference
+        "-i", temp_aug_path,
+        "-i", src_reference_path,
         "-map", "0:v:0",
         "-map_metadata", "1",
         "-r", f"{fps:.6f}",
@@ -184,14 +179,11 @@ def ffmpeg_normalize_augmented(temp_aug_path, src_reference_path, final_out_path
         "-pix_fmt", pix_fmt,
     ]
 
-    # If original has audio, try to copy it across.
-    # If not, explicitly drop audio.
     if info["has_audio"]:
         cmd += ["-map", "1:a?", "-c:a", "copy"]
     else:
         cmd += ["-an"]
 
-    # Conservative quality settings to keep outputs reasonably close without bloating too much.
     if dst_codec == "libx264":
         cmd += ["-crf", "18", "-preset", "medium", "-movflags", "+faststart"]
     elif dst_codec == "libx265":
@@ -211,9 +203,52 @@ def ffmpeg_normalize_augmented(temp_aug_path, src_reference_path, final_out_path
 # ==========================================
 # 4. VIDEO AUGMENTATION
 # ==========================================
+def apply_night_transform(frame_bgr, rng):
+    """
+    Simulate low-light CCTV / night-vision-like footage:
+    - grayscale
+    - darken
+    - gamma curve
+    - slight contrast boost
+    - visible sensor noise
+    - mild blur
+    """
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    # Darken overall scene
+    brightness_scale = rng.uniform(0.42, 0.60)
+    gray *= brightness_scale
+
+    # Gamma darkening
+    gamma = rng.uniform(1.8, 2.4)
+    gray = np.clip(gray / 255.0, 0.0, 1.0)
+    gray = np.power(gray, gamma)
+
+    # Slight contrast boost around midtones
+    contrast = rng.uniform(1.08, 1.22)
+    gray = np.clip((gray - 0.5) * contrast + 0.5, 0.0, 1.0)
+
+    # Back to 8-bit
+    gray = (gray * 255.0).astype(np.float32)
+
+    # Add low-light sensor noise
+    noise_sigma = rng.uniform(5.0, 10.0)
+    noise = rng.normal(0.0, noise_sigma, gray.shape).astype(np.float32)
+    gray = np.clip(gray + noise, 0, 255)
+
+    # Mild blur to soften details a bit
+    blur_choice = rng.choice([0, 3, 5], p=[0.30, 0.50, 0.20])
+    if blur_choice > 0:
+        gray = cv2.GaussianBlur(gray, (blur_choice, blur_choice), 0)
+
+    gray_u8 = gray.astype(np.uint8)
+    out = cv2.cvtColor(gray_u8, cv2.COLOR_GRAY2BGR)
+    return out
+
+
 def augment_video_with_ffmpeg_match(input_path, output_path, aug_type):
     """
-    1) Decode and augment frames with OpenCV + Albumentations
+    1) Decode and augment frames with OpenCV + Albumentations / custom transform
     2) Save temporary video
     3) Re-encode with ffmpeg to match source properties more closely
     """
@@ -247,6 +282,7 @@ def augment_video_with_ffmpeg_match(input_path, output_path, aug_type):
 
     frame_count = 0
     replay_params = None
+    night_rng = None
 
     try:
         while True:
@@ -272,6 +308,12 @@ def augment_video_with_ffmpeg_match(input_path, output_path, aug_type):
                     replay_params = data["replay"]
                 else:
                     aug_frame = A.ReplayCompose.replay(replay_params, image=frame)["image"]
+
+            elif aug_type == "night":
+                if frame_count == 0:
+                    seed_int = int(hashlib.md5(str(input_path).encode("utf-8")).hexdigest()[:8], 16)
+                    night_rng = np.random.default_rng(seed_int)
+                aug_frame = apply_night_transform(frame, night_rng)
 
             else:
                 print(f"Error: Unknown augmentation type: {aug_type}")
@@ -370,9 +412,14 @@ def get_assistant_text(record):
     return json.dumps(record, ensure_ascii=False)
 
 
-def is_hazard_present(record):
+def get_parsed_assistant_json(record):
     assistant_text = get_assistant_text(record)
     parsed = parse_possible_json(assistant_text)
+    return parsed if isinstance(parsed, dict) else None
+
+
+def is_hazard_present(record):
+    parsed = get_parsed_assistant_json(record)
     if isinstance(parsed, dict):
         val = str(parsed.get("hazard_present", "")).strip().lower()
         if val == "yes":
@@ -383,6 +430,17 @@ def is_hazard_present(record):
     record_str = json.dumps(record, ensure_ascii=False).lower()
     clean_str = re.sub(r'[\s"\'\\:]', '', record_str)
     return "hazard_presentyes" in clean_str
+
+
+def get_zone_relation(record):
+    parsed = get_parsed_assistant_json(record)
+    if isinstance(parsed, dict):
+        return str(parsed.get("zone_relation", "")).strip().lower()
+    return ""
+
+
+def should_create_night_version(record):
+    return get_zone_relation(record) in NIGHT_AUG_ZONE_RELATIONS
 
 
 def get_video_path(record):
@@ -487,7 +545,7 @@ def main():
     random.seed(RANDOM_SEED)
 
     hazard_families = []
-    no_hazard_records = []
+    clean_records = []
 
     print("1. Parsing Original Data...")
     for jsonl_file in ORIGINAL_JSONL_PATHS:
@@ -512,9 +570,9 @@ def main():
                 if is_hazard_present(record):
                     hazard_families.append([record])
                 else:
-                    no_hazard_records.append(record)
+                    clean_records.append(record)
 
-    print(f"Found {len(hazard_families)} hazard instances and {len(no_hazard_records)} clean instances.")
+    print(f"Found {len(hazard_families)} hazard instances and {len(clean_records)} clean instances.")
 
     print("\n2. Processing Hazard Data (Copying & Augmenting)...")
     processed_hazard_families = []
@@ -570,62 +628,92 @@ def main():
     hazard_families = processed_hazard_families
     print(f"Kept {len(hazard_families)} hazard families after file validation.")
 
-    print("\n3. Processing Non-Hazard Data (Cloning physically)...")
-    processed_no_hazard_records = []
-
-    for record in no_hazard_records:
+    print("\n3. Processing Clean Data as Families (copy + selective night aug)...")
+    processed_clean_families = []
+    night_aug_count = 0
+    
+    for record in clean_records:
         raw_video_path = get_video_path(record)
         source_jsonl_path = record.get("_source_jsonl", "")
-
+    
         resolved_video_path = resolve_input_video_path(
             raw_video_path,
             source_jsonl_path,
             PROJECT_ROOT,
         )
-
+    
         if not resolved_video_path:
             continue
-
+    
         base_output_name = make_stable_output_name(resolved_video_path)
-        new_vid_path = os.path.join(OUTPUT_VIDEOS_DIR, base_output_name)
-
+        base_stem = base_output_name[:-4] if base_output_name.endswith(".mp4") else base_output_name
+    
+        new_vid_path = os.path.join(OUTPUT_VIDEOS_DIR, f"{base_stem}.mp4")
+    
         if not os.path.exists(new_vid_path):
             if USE_FFMPEG_FOR_CLEAN_COPY:
                 ffmpeg_stream_copy(resolved_video_path, new_vid_path)
             else:
                 shutil.copy2(resolved_video_path, new_vid_path)
-
+    
+        family = []
+    
         new_record = set_video_path(record, new_vid_path)
         new_record.pop("_source_jsonl", None)
-        processed_no_hazard_records.append(new_record)
-
-    no_hazard_records = processed_no_hazard_records
-    print(f"Kept {len(no_hazard_records)} clean records after file validation.")
+        family.append(new_record)
+    
+        if should_create_night_version(record):
+            night_vid_path = os.path.join(OUTPUT_VIDEOS_DIR, f"{base_stem}_aug_night.mp4")
+    
+            if not os.path.exists(night_vid_path):
+                ok = augment_video_with_ffmpeg_match(resolved_video_path, night_vid_path, "night")
+                if not ok:
+                    print(f"Warning: night augmentation failed for {resolved_video_path}")
+                else:
+                    night_record = set_video_path(record, night_vid_path)
+                    night_record.pop("_source_jsonl", None)
+                    family.append(night_record)
+                    night_aug_count += 1
+            else:
+                night_record = set_video_path(record, night_vid_path)
+                night_record.pop("_source_jsonl", None)
+                family.append(night_record)
+                night_aug_count += 1
+    
+        processed_clean_families.append(family)
+    
+    clean_families = processed_clean_families
+    print(f"Kept {len(clean_families)} clean families after file validation.")
+    print(f"Created {night_aug_count} selective night-augmented clean records.")
 
     print("\n4. Shuffling and Splitting Data Safely...")
     random.shuffle(hazard_families)
-    random.shuffle(no_hazard_records)
+    random.shuffle(clean_families)
+    
+    total_hazard_families = len(hazard_families)
+    train_h_fam_end = int(total_hazard_families * SPLIT_RATIOS["train"])
+    val_h_fam_end = train_h_fam_end + int(total_hazard_families * SPLIT_RATIOS["val"])
+    
+    train_hazard_families = hazard_families[:train_h_fam_end]
+    val_hazard_families = hazard_families[train_h_fam_end:val_h_fam_end]
+    test_hazard_families = hazard_families[val_h_fam_end:]
+    
+    total_clean_families = len(clean_families)
+    train_c_fam_end = int(total_clean_families * SPLIT_RATIOS["train"])
+    val_c_fam_end = train_c_fam_end + int(total_clean_families * SPLIT_RATIOS["val"])
+    
+    train_clean_families = clean_families[:train_c_fam_end]
+    val_clean_families = clean_families[train_c_fam_end:val_c_fam_end]
+    test_clean_families = clean_families[val_c_fam_end:]
 
-    total_families = len(hazard_families)
-    train_fam_end = int(total_families * SPLIT_RATIOS["train"])
-    val_fam_end = train_fam_end + int(total_families * SPLIT_RATIOS["val"])
-
-    train_families = hazard_families[:train_fam_end]
-    val_families = hazard_families[train_fam_end:val_fam_end]
-    test_families = hazard_families[val_fam_end:]
-
-    total_no_haz = len(no_hazard_records)
-    train_no_end = int(total_no_haz * SPLIT_RATIOS["train"])
-    val_no_end = train_no_end + int(total_no_haz * SPLIT_RATIOS["val"])
-
-    train_no = no_hazard_records[:train_no_end]
-    val_no = no_hazard_records[train_no_end:val_no_end]
-    test_no = no_hazard_records[val_no_end:]
-
-    train_yes = [r for fam in train_families for r in fam]
-    val_yes = [r for fam in val_families for r in fam]
-    test_yes = [r for fam in test_families for r in fam]
-
+    train_yes = [r for fam in train_hazard_families for r in fam]
+    val_yes = [r for fam in val_hazard_families for r in fam]
+    test_yes = [r for fam in test_hazard_families for r in fam]
+    
+    train_no = [r for fam in train_clean_families for r in fam]
+    val_no = [r for fam in val_clean_families for r in fam]
+    test_no = [r for fam in test_clean_families for r in fam]
+    
     final_train = train_yes + train_no
     final_val = val_yes + val_no
     final_test = test_yes + test_no
