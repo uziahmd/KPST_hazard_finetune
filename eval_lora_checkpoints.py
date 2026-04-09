@@ -38,8 +38,8 @@ Outputs:
 
 Example:
 python eval_lora_checkpoints.py \
-    --adapter_dir runs/qwen35_9b_lora_newprompt \
-    --test_file vlm_dataset/test_chat.jsonl \
+    --adapter_dir runs/qwen35_9b_v3 \
+    --test_file vlm_dataset_v2/test_chat.jsonl \
     --project_root . \
     --use_fp16 \
     --num_frames 12 \
