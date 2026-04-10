@@ -351,6 +351,23 @@ def materialize_local_videos(
     return messages
 
 
+def get_decoded_video_num_frames(messages: List[Dict[str, Any]]) -> Optional[int]:
+    for msg in messages:
+        content = msg.get("content", [])
+        if not isinstance(content, list):
+            continue
+
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "video":
+                continue
+            video_obj = item.get("video")
+            if isinstance(video_obj, np.ndarray) and video_obj.ndim >= 1:
+                return int(video_obj.shape[0])
+            if isinstance(video_obj, torch.Tensor) and video_obj.ndim >= 1:
+                return int(video_obj.shape[0])
+    return None
+
+
 def extract_assistant_text(message: Dict[str, Any]) -> str:
     if message["role"] != "assistant":
         raise ValueError("Expected an assistant message.")
@@ -467,16 +484,19 @@ class RawVideoGemmaCollator:
 
         full_messages = messages
         prompt_messages = messages[:-1]
+        effective_num_frames = get_decoded_video_num_frames(full_messages)
 
         full_batch = apply_chat_template_gemma(
             self.processor,
             full_messages,
             add_generation_prompt=False,
+            num_frames=effective_num_frames,
         )
         prompt_batch = apply_chat_template_gemma(
             self.processor,
             prompt_messages,
             add_generation_prompt=True,
+            num_frames=effective_num_frames,
         )
 
         labels = full_batch["input_ids"].clone()
@@ -650,11 +670,13 @@ def run_one_inference_example(
     )
     prompt_messages = messages[:-1]
     ground_truth = extract_assistant_text(messages[-1])
+    effective_num_frames = get_decoded_video_num_frames(messages)
 
     inputs = apply_chat_template_gemma(
         processor,
         prompt_messages,
         add_generation_prompt=True,
+        num_frames=effective_num_frames,
     )
 
     device = next(model.parameters()).device
