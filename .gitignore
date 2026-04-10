@@ -28,6 +28,7 @@ tmp_*/
 
 # Additional data folders
 data/
+vlm_dataset/
 vlm_dataset_*/
 runs/
 .tmp_*/

@@ -2,12 +2,13 @@
 """
 Gemma 4 E4B-it LoRA fine-tuning on a raw-video chat JSONL dataset.
 
-Designed to mirror the user's Qwen 3.5 raw-video training script:
+Designed to mirror the user's Qwen 3.5 raw-video training script while
+keeping Gemma 4 on its native multimodal path:
 - Same JSONL chat format
 - Same assistant-only loss masking
 - Same raw video paths inside messages
 - Same Trainer-style loop
-- Gemma 4 multimodal loading path
+- Gemma 4 video loading via AutoModelForMultimodalLM + AutoProcessor
 
 Expected row format:
 {
@@ -31,13 +32,14 @@ Expected row format:
 }
 
 Example run:
-python train_gemma4_video_lora.py \
+python train_gemma4.py \
   --train_file vlm_dataset_both_aug/train_chat.jsonl \
   --val_file   vlm_dataset_both_aug/val_chat.jsonl \
   --test_file  vlm_dataset_both_aug/test_chat.jsonl \
   --project_root hazard_finetuning \
   --model_name_or_path google/gemma-4-E4B-it \
   --output_dir runs/gemma4_e4b_video_lora \
+  --fps 1 \
   --per_device_train_batch_size 1 \
   --per_device_eval_batch_size 1 \
   --gradient_accumulation_steps 8 \
@@ -93,6 +95,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--num_frames", type=int, default=12,
                         help="Requested frame count for video processing if the processor version supports it.")
+    parser.add_argument("--fps", type=float, default=None,
+                        help="Optional target frames-per-second for processor-side video sampling.")
     parser.add_argument("--max_new_tokens", type=int, default=128,
                         help="Used only for the post-training demo inference.")
     parser.add_argument("--inference_index", type=int, default=0)
@@ -211,9 +215,10 @@ def apply_chat_template_gemma(
     *,
     add_generation_prompt: bool,
     num_frames: Optional[int] = None,
+    fps: Optional[float] = None,
 ):
     """
-    Use Gemma's official multimodal chat template path.
+    Use Gemma's native multimodal chat template path for raw-video messages.
     We try a few compatible call signatures because processor support can vary a bit by version.
     """
     base_kwargs = dict(
@@ -229,6 +234,8 @@ def apply_chat_template_gemma(
     processor_kwargs = {}
     if num_frames is not None:
         processor_kwargs["num_frames"] = num_frames
+    if fps is not None:
+        processor_kwargs["fps"] = fps
 
     if processor_kwargs:
         attempts.append({**base_kwargs, "enable_thinking": False, "processor_kwargs": processor_kwargs})
@@ -259,10 +266,11 @@ class RawVideoGemmaCollator:
     Use gradient accumulation for larger effective batch size.
     """
 
-    def __init__(self, processor, project_root: str, num_frames: int):
+    def __init__(self, processor, project_root: str, num_frames: int, fps: Optional[float]):
         self.processor = processor
         self.project_root = Path(project_root)
         self.num_frames = num_frames
+        self.fps = fps
 
         if self.processor.tokenizer.pad_token is None:
             self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
@@ -290,12 +298,14 @@ class RawVideoGemmaCollator:
             full_messages,
             add_generation_prompt=False,
             num_frames=self.num_frames,
+            fps=self.fps,
         )
         prompt_batch = apply_chat_template_gemma(
             self.processor,
             prompt_messages,
             add_generation_prompt=True,
             num_frames=self.num_frames,
+            fps=self.fps,
         )
 
         labels = full_batch["input_ids"].clone()
@@ -347,7 +357,7 @@ def load_model_and_processor(args: argparse.Namespace, dtype: torch.dtype):
         )
         model_kwargs["quantization_config"] = quantization_config
     else:
-        model_kwargs["dtype"] = dtype
+        model_kwargs["torch_dtype"] = dtype
 
     model = AutoModelForMultimodalLM.from_pretrained(
         args.model_name_or_path,
@@ -454,6 +464,7 @@ def run_one_inference_example(
     example: Dict[str, Any],
     project_root: str,
     num_frames: int,
+    fps: Optional[float],
     max_new_tokens: int,
 ) -> None:
     model.eval()
@@ -467,6 +478,7 @@ def run_one_inference_example(
         prompt_messages,
         add_generation_prompt=True,
         num_frames=num_frames,
+        fps=fps,
     )
 
     device = next(model.parameters()).device
@@ -522,6 +534,7 @@ def main():
         processor=processor,
         project_root=args.project_root,
         num_frames=args.num_frames,
+        fps=args.fps,
     )
 
     # Disable eval if val file is absent
@@ -551,6 +564,7 @@ def main():
         example=dataset["test"][demo_idx],
         project_root=args.project_root,
         num_frames=args.num_frames,
+        fps=args.fps,
         max_new_tokens=args.max_new_tokens,
     )
 
