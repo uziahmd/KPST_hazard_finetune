@@ -41,10 +41,6 @@ NIGHT_AUG_ZONE_RELATIONS = {"no_worker", "no_forklift"}
 # ==========================================
 # 2. AUGMENTATION SETUP
 # ==========================================
-transform_flip = A.Compose([
-    A.HorizontalFlip(p=1.0)
-])
-
 transform_tilt = A.ReplayCompose([
     A.Perspective(scale=(0.02, 0.05), p=1.0)
 ])
@@ -205,44 +201,18 @@ def ffmpeg_normalize_augmented(temp_aug_path, src_reference_path, final_out_path
 # ==========================================
 def apply_night_transform(frame_bgr, rng):
     """
-    Simulate low-light CCTV / night-vision-like footage:
+    Mild night-style transform:
     - grayscale
-    - darken
-    - gamma curve
-    - slight contrast boost
-    - visible sensor noise
-    - mild blur
+    - very slight darkening
     """
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
-    # Darken overall scene
-    brightness_scale = rng.uniform(0.42, 0.60)
+    # Very mild darkening only
+    brightness_scale = rng.uniform(0.82, 0.92)
     gray *= brightness_scale
 
-    # Gamma darkening
-    gamma = rng.uniform(1.8, 2.4)
-    gray = np.clip(gray / 255.0, 0.0, 1.0)
-    gray = np.power(gray, gamma)
-
-    # Slight contrast boost around midtones
-    contrast = rng.uniform(1.08, 1.22)
-    gray = np.clip((gray - 0.5) * contrast + 0.5, 0.0, 1.0)
-
-    # Back to 8-bit
-    gray = (gray * 255.0).astype(np.float32)
-
-    # Add low-light sensor noise
-    noise_sigma = rng.uniform(5.0, 10.0)
-    noise = rng.normal(0.0, noise_sigma, gray.shape).astype(np.float32)
-    gray = np.clip(gray + noise, 0, 255)
-
-    # Mild blur to soften details a bit
-    blur_choice = rng.choice([0, 3, 5], p=[0.30, 0.50, 0.20])
-    if blur_choice > 0:
-        gray = cv2.GaussianBlur(gray, (blur_choice, blur_choice), 0)
-
-    gray_u8 = gray.astype(np.uint8)
-    out = cv2.cvtColor(gray_u8, cv2.COLOR_GRAY2BGR)
+    gray = np.clip(gray, 0, 255).astype(np.uint8)
+    out = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     return out
 
 
@@ -289,9 +259,6 @@ def augment_video_with_ffmpeg_match(input_path, output_path, aug_type):
             ret, frame = cap.read()
             if not ret:
                 break
-
-            if aug_type == "flip":
-                aug_frame = transform_flip(image=frame)["image"]
 
             elif aug_type == "tilt":
                 if frame_count == 0:
@@ -605,7 +572,7 @@ def main():
 
         new_family = [set_video_path(original_record, new_orig_path)]
 
-        for aug in ["flip", "tilt", "bc"]:
+        for aug in ["tilt", "bc"]:
             aug_vid_path = os.path.join(OUTPUT_VIDEOS_DIR, f"{base_stem}_aug_{aug}.mp4")
             if not os.path.exists(aug_vid_path):
                 ok = augment_video_with_ffmpeg_match(resolved_video_path, aug_vid_path, aug)

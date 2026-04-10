@@ -40,11 +40,11 @@ Expected row format:
 RUN
 
 python train_qwen35_video_lora.py \
-  --train_file vlm_dataset_v2/train_chat.jsonl \
-  --val_file   vlm_dataset_v2/val_chat.jsonl \
-  --test_file  vlm_dataset_v2/test_chat.jsonl \
+  --train_file vlm_dataset_robot/train_chat.jsonl \
+  --val_file   vlm_dataset_robot/val_chat.jsonl \
+  --test_file  vlm_dataset_robot/test_chat.jsonl \
   --model_name_or_path Qwen/Qwen3.5-9B \
-  --output_dir runs/qwen35_9b_v3 \
+  --output_dir runs/qwen35_9b_robot \
   --num_frames 12 \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 8 \
@@ -73,6 +73,7 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from typing import Any, Dict, List, Optional
+from dotenv import load_dotenv
 
 import torch
 from datasets import load_dataset
@@ -85,6 +86,15 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
+
+# Load variables from .env into os.environ
+load_dotenv(override=True)
+
+# Verification (Optional: remove this in production)
+if os.getenv("HF_TOKEN"):
+    print("HF_TOKEN successfully loaded from .env")
+else:
+    print("Warning: HF_TOKEN not found in .env")
 
 
 def parse_args() -> argparse.Namespace:

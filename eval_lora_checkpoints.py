@@ -5,49 +5,45 @@ Evaluate:
 2) the final LoRA adapter,
 3) every checkpoint-* adapter,
 
-on a test chat file that looks like:
+on a test chat file that may contain:
+- forklift task samples:
+    fields = hazard_label, hazard_present, zone_relation, object_state, object_direction
+- robot task samples:
+    fields = hazard_label, hazard_present, zone_relation, object_state
 
-{
-  "sample_id": "...",
-  "messages": [
-    {
-      "role": "user",
-      "content": [
-        {"type": "video", "video": "relative/or/absolute/path.mp4"},
-        {"type": "text", "text": "prompt text ..."}
-      ]
-    },
-    {
-      "role": "assistant",
-      "content": [
-        {"type": "text", "text": "{\"hazard_label\": ... }"}
-      ]
-    }
-  ],
-  "meta": {...}
-}
+Key updates:
+- task-adaptive scoring
+- exact match scored only on fields relevant to that sample's task
+- separate metrics for forklift, robot, and combined
+- CLI toggle for mixed-task vs single-task test files via --task_mode
 
-Also supports a legacy conversational format with `from` / `value` and top-level `video`.
-
-Outputs:
-- <adapter_dir>/eval_results/base_pretrained.json
-- <adapter_dir>/eval_results/final.json
-- <adapter_dir>/eval_results/checkpoint-XXXX.json
-- <adapter_dir>/eval_results/summary.md
-- <adapter_dir>/eval_results/all_metrics.json
-
-Example:
+Example: (MIXED)
 python eval_lora_checkpoints.py \
-    --adapter_dir runs/qwen35_9b_v3 \
-    --test_file vlm_dataset_v2/test_chat.jsonl \
-    --project_root . \
-    --use_fp16 \
-    --num_frames 12 \
-    --max_new_tokens 256
+  --adapter_dir runs/qwen35_9b_both \
+  --test_file vlm_dataset_both/test_chat.jsonl \
+  --project_root . \
+  --task_mode both \
+  --use_fp16
+
+  (FORKLIFT)
+python eval_lora_checkpoints.py \
+  --adapter_dir runs/qwen35_9b_forklift \
+  --test_file vlm_dataset_forklift/test_chat.jsonl \
+  --project_root . \
+  --task_mode forklift \
+  --use_fp16
+
+
+    (ROBOT)
+python eval_lora_checkpoints.py \
+  --adapter_dir runs/qwen35_9b_robot \
+  --test_file vlm_dataset_robot/test_chat.jsonl \
+  --project_root . \
+  --task_mode robot \
+  --use_fp16
 """
 
 import argparse
-import copy
 import gc
 import glob
 import json
@@ -77,13 +73,35 @@ except Exception:
     HAS_TQDM = False
 
 
-EVAL_FIELDS = [
+# -----------------------------------------------------------------------------
+# Task config
+# -----------------------------------------------------------------------------
+
+ALL_FIELDS = [
     "hazard_label",
     "hazard_present",
     "zone_relation",
     "object_state",
     "object_direction",
 ]
+
+TASK_FIELDS = {
+    "forklift": [
+        "hazard_label",
+        "hazard_present",
+        "zone_relation",
+        "object_state",
+        "object_direction",
+    ],
+    "robot": [
+        "hazard_label",
+        "hazard_present",
+        "zone_relation",
+        "object_state",
+    ],
+}
+
+TASK_CHOICES = ["forklift", "robot", "both"]
 
 
 # -----------------------------------------------------------------------------
@@ -117,12 +135,36 @@ def parse_args() -> argparse.Namespace:
                    help="Evaluate only the final adapter, skip checkpoints.")
     p.add_argument("--only_checkpoints", type=str, default=None,
                    help="Comma-separated checkpoint steps to evaluate, e.g. '26,52'.")
+    p.add_argument(
+        "--task_mode",
+        type=str,
+        default="both",
+        choices=TASK_CHOICES,
+        help=(
+            "Task mode for the test file: "
+            "'forklift' for forklift-only data, "
+            "'robot' for robot-only data, "
+            "'both' for mixed-task data."
+        ),
+    )
     return p.parse_args()
 
 
 # -----------------------------------------------------------------------------
 # General helpers
 # -----------------------------------------------------------------------------
+
+def safe_round(x: Optional[float], ndigits: int = 4) -> Optional[float]:
+    if x is None:
+        return None
+    return round(x, ndigits)
+
+
+def fmt_metric(x: Optional[float]) -> str:
+    if x is None:
+        return "-"
+    return f"{x:.4f}"
+
 
 def select_dtype(args: argparse.Namespace) -> torch.dtype:
     if args.use_bf16:
@@ -177,7 +219,6 @@ def apply_chat_template_video_safe(
 
 
 def resolve_media_path(path_str: str, project_root: str, test_file_dir: str) -> str:
-    """Resolve video/image paths without changing already valid absolute paths."""
     if not path_str:
         return path_str
 
@@ -203,13 +244,6 @@ def normalize_content_items(
     project_root: str,
     test_file_dir: str,
 ) -> List[Dict[str, Any]]:
-    """
-    Normalize message content into the shape expected by processor chat templates:
-    [
-      {"type": "video", "video": "..."},
-      {"type": "text", "text": "..."}
-    ]
-    """
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
 
@@ -251,7 +285,6 @@ def normalize_content_items(
             })
 
         else:
-            # Preserve unknown item types as text fallback.
             normalized.append({
                 "type": "text",
                 "text": json.dumps(item, ensure_ascii=False),
@@ -266,11 +299,6 @@ def normalize_message(
     project_root: str,
     test_file_dir: str,
 ) -> Dict[str, Any]:
-    """
-    Supports:
-    1) {"role": "...", "content": [...]}
-    2) {"from": "human"/"gpt", "value": "..."} with optional top-level example["video"]
-    """
     if "role" in msg:
         return {
             "role": msg["role"],
@@ -347,9 +375,6 @@ def extract_text_from_message(message: Dict[str, Any]) -> str:
 
 
 def split_prompt_and_target(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Use the LAST assistant message as target and everything before it as input prompt.
-    """
     last_assistant_idx = None
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].get("role") == "assistant":
@@ -365,7 +390,6 @@ def split_prompt_and_target(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[s
 
 
 def extract_first_json_object(text: str) -> Optional[str]:
-    """Find the first balanced JSON object in a string."""
     if not text:
         return None
 
@@ -439,11 +463,100 @@ def canonicalize_prediction_dict(obj: Optional[Dict[str, Any]]) -> Optional[Dict
     return out
 
 
-def get_model_device(model) -> torch.device:
-    try:
-        return next(model.parameters()).device
-    except StopIteration:
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# -----------------------------------------------------------------------------
+# Task inference
+# -----------------------------------------------------------------------------
+
+def canonicalize_task_name(task: Optional[str]) -> Optional[str]:
+    if task is None:
+        return None
+    s = str(task).strip().lower()
+    s = s.replace("-", "_").replace(" ", "_")
+
+    if s in {"forklift", "fork", "fork_lift", "forklift_entry_hazard"}:
+        return "forklift"
+
+    if s in {
+        "robot",
+        "machine",
+        "machinery",
+        "robot_zone_intrusion",
+        "human_machine_shared_workspace",
+        "robot_hazard",
+    }:
+        return "robot"
+
+    return None
+
+
+def infer_task_from_text(text: str) -> Optional[str]:
+    t = (text or "").lower()
+    if "forklift" in t:
+        return "forklift"
+    if "robot" in t or "machine workspace" in t or "robot zone" in t:
+        return "robot"
+    return None
+
+
+def infer_task(
+    example: Dict[str, Any],
+    prompt_messages: List[Dict[str, Any]],
+    gt_parsed: Dict[str, Any],
+    task_mode: str,
+) -> str:
+    if task_mode in {"forklift", "robot"}:
+        return task_mode
+
+    meta = example.get("meta", {}) or {}
+
+    # 1) explicit task metadata
+    for candidate in [
+        meta.get("task"),
+        example.get("task"),
+        meta.get("task_name"),
+        meta.get("eval_task"),
+    ]:
+        task = canonicalize_task_name(candidate)
+        if task is not None:
+            return task
+
+    # 2) sample_id conventions
+    sample_id = str(example.get("sample_id", "")).lower()
+    if sample_id.startswith("fork_") or sample_id.startswith("forklift_") or "_fork_" in sample_id:
+        return "forklift"
+    if sample_id.startswith("robot_") or "_robot_" in sample_id:
+        return "robot"
+
+    # 3) label signature conventions
+    label_signature = str(meta.get("label_signature", "")).lower()
+    if label_signature.startswith("forklift|") or label_signature.startswith("fork|"):
+        return "forklift"
+    if label_signature.startswith("robot|"):
+        return "robot"
+
+    # 4) ground truth keys
+    if "object_direction" in gt_parsed:
+        return "forklift"
+    robot_core = {"hazard_label", "hazard_present", "zone_relation", "object_state"}
+    if robot_core.issubset(set(gt_parsed.keys())):
+        return "robot"
+
+    # 5) prompt text
+    joined_prompt = "\n".join(
+        extract_text_from_message(m) for m in prompt_messages if m.get("role") != "assistant"
+    )
+    task = infer_task_from_text(joined_prompt)
+    if task is not None:
+        return task
+
+    # Final fallback:
+    # If mixed mode and still unknown, default based on presence/absence of object_direction.
+    # If it isn't there, robot is safer.
+    return "robot"
+
+
+def get_fields_for_task(task: str) -> List[str]:
+    return TASK_FIELDS.get(task, TASK_FIELDS["robot"])
 
 
 # -----------------------------------------------------------------------------
@@ -544,11 +657,7 @@ def run_inference_single(
     )
 
     device = next(model.parameters()).device
-    # print(f"[DEBUG] model device: {device}", flush=True)  # Optional: Hide if too noisy
     inputs = move_batch_to_device(inputs, device)
-    
-    # if "input_ids" in inputs:
-    #     print(f"[DEBUG] input_ids device: {inputs['input_ids'].device}", flush=True) # Optional: Hide if too noisy
 
     generated_ids = model.generate(
         **inputs,
@@ -579,15 +688,17 @@ def run_inference_single(
 def compute_classification_stats(y_true: List[str], y_pred: List[str]) -> Dict[str, Any]:
     assert len(y_true) == len(y_pred)
     n = len(y_true)
+
     if n == 0:
         return {
-            "accuracy": 0.0,
-            "macro_precision": 0.0,
-            "macro_recall": 0.0,
-            "macro_f1": 0.0,
-            "weighted_precision": 0.0,
-            "weighted_recall": 0.0,
-            "weighted_f1": 0.0,
+            "num_scored_samples": 0,
+            "accuracy": None,
+            "macro_precision": None,
+            "macro_recall": None,
+            "macro_f1": None,
+            "weighted_precision": None,
+            "weighted_recall": None,
+            "weighted_f1": None,
             "labels": {},
         }
 
@@ -615,9 +726,9 @@ def compute_classification_stats(y_true: List[str], y_pred: List[str]) -> Dict[s
             "fp": fp,
             "fn": fn,
             "support": support,
-            "precision": round(precision, 4),
-            "recall": round(recall, 4),
-            "f1": round(f1, 4),
+            "precision": safe_round(precision),
+            "recall": safe_round(recall),
+            "f1": safe_round(f1),
         }
 
         macro_p += precision
@@ -630,31 +741,41 @@ def compute_classification_stats(y_true: List[str], y_pred: List[str]) -> Dict[s
         total_support += support
 
     k = len(labels)
-    macro_p = macro_p / k if k > 0 else 0.0
-    macro_r = macro_r / k if k > 0 else 0.0
-    macro_f1 = macro_f1 / k if k > 0 else 0.0
+    macro_p = macro_p / k if k > 0 else None
+    macro_r = macro_r / k if k > 0 else None
+    macro_f1 = macro_f1 / k if k > 0 else None
 
-    weighted_p = weighted_p / total_support if total_support > 0 else 0.0
-    weighted_r = weighted_r / total_support if total_support > 0 else 0.0
-    weighted_f1 = weighted_f1 / total_support if total_support > 0 else 0.0
+    weighted_p = weighted_p / total_support if total_support > 0 else None
+    weighted_r = weighted_r / total_support if total_support > 0 else None
+    weighted_f1 = weighted_f1 / total_support if total_support > 0 else None
 
     return {
-        "accuracy": round(accuracy, 4),
-        "macro_precision": round(macro_p, 4),
-        "macro_recall": round(macro_r, 4),
-        "macro_f1": round(macro_f1, 4),
-        "weighted_precision": round(weighted_p, 4),
-        "weighted_recall": round(weighted_r, 4),
-        "weighted_f1": round(weighted_f1, 4),
+        "num_scored_samples": n,
+        "accuracy": safe_round(accuracy),
+        "macro_precision": safe_round(macro_p),
+        "macro_recall": safe_round(macro_r),
+        "macro_f1": safe_round(macro_f1),
+        "weighted_precision": safe_round(weighted_p),
+        "weighted_recall": safe_round(weighted_r),
+        "weighted_f1": safe_round(weighted_f1),
         "labels": per_label,
     }
 
 
 def compute_hazard_present_binary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if len(results) == 0:
+        return {
+            "tp": 0, "fp": 0, "fn": 0, "tn": 0,
+            "precision": None, "recall": None, "f1": None,
+        }
+
     tp = fp = fn = tn = 0
 
     for r in results:
         gt = r["ground_truth"]
+        if r.get("ground_truth_parse_failed", False):
+            continue
+
         pred = r.get("prediction_parsed")
 
         gt_hp = str(gt.get("hazard_present", "no")).strip()
@@ -680,31 +801,60 @@ def compute_hazard_present_binary(results: List[Dict[str, Any]]) -> Dict[str, An
         "fp": fp,
         "fn": fn,
         "tn": tn,
-        "precision": round(precision, 4),
-        "recall": round(recall, 4),
-        "f1": round(f1, 4),
+        "precision": safe_round(precision),
+        "recall": safe_round(recall),
+        "f1": safe_round(f1),
     }
 
 
-def compute_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+def filter_results_by_task(results: List[Dict[str, Any]], task: Optional[str]) -> List[Dict[str, Any]]:
+    if task is None:
+        return results
+    return [r for r in results if r.get("task") == task]
+
+
+def compute_metrics_for_subset(results: List[Dict[str, Any]], subset_name: str) -> Dict[str, Any]:
     total = len(results)
     if total == 0:
-        return {"error": "no samples"}
+        return {
+            "subset_name": subset_name,
+            "total_samples": 0,
+            "task_counts": {},
+            "ground_truth_parse_failures": 0,
+            "parse_failures": 0,
+            "exact_match_accuracy": None,
+            "relevant_field_accuracy": None,
+            "relevant_field_correct": 0,
+            "relevant_field_total": 0,
+            "per_field_accuracy": {f: None for f in ALL_FIELDS},
+            "per_field_metrics": {
+                f: compute_classification_stats([], []) for f in ALL_FIELDS
+            },
+            "hazard_present_binary": compute_hazard_present_binary([]),
+            "per_bucket_accuracy": {},
+        }
 
     parse_failures = 0
     exact_match = 0
     gt_parse_failures = 0
+    relevant_field_correct = 0
+    relevant_field_total = 0
 
     bucket_correct: Dict[str, int] = defaultdict(int)
     bucket_total: Dict[str, int] = defaultdict(int)
 
-    field_y_true = {f: [] for f in EVAL_FIELDS}
-    field_y_pred = {f: [] for f in EVAL_FIELDS}
+    field_y_true = {f: [] for f in ALL_FIELDS}
+    field_y_pred = {f: [] for f in ALL_FIELDS}
+
+    task_counts = Counter(r.get("task", "unknown") for r in results)
 
     for r in results:
         gt = r["ground_truth"]
         pred = r.get("prediction_parsed")
         bucket = r.get("hard_negative_bucket") or "positive"
+        task = r.get("task", "robot")
+        task_fields = get_fields_for_task(task)
+
 
         bucket_total[bucket] += 1
 
@@ -716,14 +866,18 @@ def compute_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             parse_failures += 1
 
         all_match = True
-        for field in EVAL_FIELDS:
+
+        for field in task_fields:
             gt_val = str(gt.get(field, "__MISSING__")).strip()
             pred_val = "__PARSE_FAIL__" if pred is None else str(pred.get(field, "__MISSING__")).strip()
 
             field_y_true[field].append(gt_val)
             field_y_pred[field].append(pred_val)
 
-            if gt_val != pred_val:
+            relevant_field_total += 1
+            if gt_val == pred_val:
+                relevant_field_correct += 1
+            else:
                 all_match = False
 
         if all_match:
@@ -732,7 +886,7 @@ def compute_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     field_metrics = {
         field: compute_classification_stats(field_y_true[field], field_y_pred[field])
-        for field in EVAL_FIELDS
+        for field in ALL_FIELDS
     }
 
     per_bucket = {}
@@ -742,20 +896,39 @@ def compute_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         per_bucket[bucket] = {
             "correct": c,
             "total": t,
-            "accuracy": round(c / t, 4) if t > 0 else 0.0,
+            "accuracy": safe_round(c / t) if t > 0 else None,
         }
 
     return {
+        "subset_name": subset_name,
         "total_samples": total,
+        "task_counts": dict(task_counts),
         "ground_truth_parse_failures": gt_parse_failures,
         "parse_failures": parse_failures,
-        "exact_match_accuracy": round(exact_match / total, 4),
+        "exact_match_accuracy": safe_round(exact_match / total) if total > 0 else None,
+        "relevant_field_accuracy": safe_round(relevant_field_correct / relevant_field_total) if relevant_field_total > 0 else None,
+        "relevant_field_correct": relevant_field_correct,
+        "relevant_field_total": relevant_field_total,
         "per_field_accuracy": {
-            field: field_metrics[field]["accuracy"] for field in EVAL_FIELDS
+            field: field_metrics[field]["accuracy"] for field in ALL_FIELDS
         },
         "per_field_metrics": field_metrics,
         "hazard_present_binary": compute_hazard_present_binary(results),
         "per_bucket_accuracy": per_bucket,
+    }
+
+
+def compute_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    combined = compute_metrics_for_subset(results, "combined")
+    forklift = compute_metrics_for_subset(filter_results_by_task(results, "forklift"), "forklift")
+    robot = compute_metrics_for_subset(filter_results_by_task(results, "robot"), "robot")
+
+    return {
+        "combined": combined,
+        "by_task": {
+            "forklift": forklift,
+            "robot": robot,
+        },
     }
 
 
@@ -768,35 +941,36 @@ def write_summary_markdown(all_results: List[Tuple[str, Dict[str, Any]]], out_pa
     lines.append("# Evaluation Summary\n")
     lines.append(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
-    # Overall
+    # -------------------------------------------------------------------------
+    # Overall model comparison
+    # -------------------------------------------------------------------------
     lines.append("## Overall Comparison\n")
     lines.append(
-        "| Model | Exact Match | Parse Fail | hazard_label Acc | hazard_present Acc | zone_relation Acc | object_state Acc | object_direction Acc | HP Precision | HP Recall | HP F1 |"
+        "| Model | Combined Exact | Combined Field Acc | Parse Fail | HP F1 | Forklift Exact | Robot Exact |"
     )
     lines.append(
-        "|------|-------------|------------|------------------|--------------------|-------------------|------------------|----------------------|-------------|-----------|-------|"
+        "|------|----------------|--------------------|------------|-------|----------------|-------------|"
     )
-
     for name, metrics in all_results:
-        pfa = metrics.get("per_field_accuracy", {})
-        hpb = metrics.get("hazard_present_binary", {})
+        c = metrics["combined"]
+        f = metrics["by_task"]["forklift"]
+        r = metrics["by_task"]["robot"]
+
         lines.append(
             f"| {name} "
-            f"| {metrics.get('exact_match_accuracy', 0):.4f} "
-            f"| {metrics.get('parse_failures', 0)} "
-            f"| {pfa.get('hazard_label', 0):.4f} "
-            f"| {pfa.get('hazard_present', 0):.4f} "
-            f"| {pfa.get('zone_relation', 0):.4f} "
-            f"| {pfa.get('object_state', 0):.4f} "
-            f"| {pfa.get('object_direction', 0):.4f} "
-            f"| {hpb.get('precision', 0):.4f} "
-            f"| {hpb.get('recall', 0):.4f} "
-            f"| {hpb.get('f1', 0):.4f} |"
+            f"| {fmt_metric(c.get('exact_match_accuracy'))} "
+            f"| {fmt_metric(c.get('relevant_field_accuracy'))} "
+            f"| {c.get('parse_failures', 0)} "
+            f"| {fmt_metric(c.get('hazard_present_binary', {}).get('f1'))} "
+            f"| {fmt_metric(f.get('exact_match_accuracy'))} "
+            f"| {fmt_metric(r.get('exact_match_accuracy'))} |"
         )
     lines.append("")
 
-    # Per-field macro F1
-    lines.append("## Per-Field Macro F1\n")
+    # -------------------------------------------------------------------------
+    # Combined per-field accuracy
+    # -------------------------------------------------------------------------
+    lines.append("## Combined Per-Field Accuracy\n")
     lines.append(
         "| Model | hazard_label | hazard_present | zone_relation | object_state | object_direction |"
     )
@@ -804,53 +978,88 @@ def write_summary_markdown(all_results: List[Tuple[str, Dict[str, Any]]], out_pa
         "|------|--------------|----------------|---------------|--------------|------------------|"
     )
     for name, metrics in all_results:
-        pfm = metrics.get("per_field_metrics", {})
+        pfa = metrics["combined"]["per_field_accuracy"]
         lines.append(
             f"| {name} "
-            f"| {pfm.get('hazard_label', {}).get('macro_f1', 0):.4f} "
-            f"| {pfm.get('hazard_present', {}).get('macro_f1', 0):.4f} "
-            f"| {pfm.get('zone_relation', {}).get('macro_f1', 0):.4f} "
-            f"| {pfm.get('object_state', {}).get('macro_f1', 0):.4f} "
-            f"| {pfm.get('object_direction', {}).get('macro_f1', 0):.4f} |"
+            f"| {fmt_metric(pfa.get('hazard_label'))} "
+            f"| {fmt_metric(pfa.get('hazard_present'))} "
+            f"| {fmt_metric(pfa.get('zone_relation'))} "
+            f"| {fmt_metric(pfa.get('object_state'))} "
+            f"| {fmt_metric(pfa.get('object_direction'))} |"
         )
     lines.append("")
 
-    # Improvement vs base
-    base_metrics = None
-    if all_results:
-        base_name, first_metrics = all_results[0]
-        base_metrics = first_metrics
-
-        lines.append(f"## Improvement vs {base_name}\n")
-        lines.append(
-            "| Model | Δ Exact Match | Δ hazard_label Acc | Δ hazard_present Acc | Δ zone_relation Acc | Δ object_state Acc | Δ object_direction Acc | Δ HP F1 |"
-        )
-        lines.append(
-            "|------|----------------|--------------------|----------------------|---------------------|--------------------|------------------------|--------|"
-        )
-
-        base_pfa = base_metrics.get("per_field_accuracy", {})
-        base_hpf1 = base_metrics.get("hazard_present_binary", {}).get("f1", 0)
-
-        for name, metrics in all_results[1:]:
-            pfa = metrics.get("per_field_accuracy", {})
-            hp_f1 = metrics.get("hazard_present_binary", {}).get("f1", 0)
-            lines.append(
-                f"| {name} "
-                f"| {metrics.get('exact_match_accuracy', 0) - base_metrics.get('exact_match_accuracy', 0):+.4f} "
-                f"| {pfa.get('hazard_label', 0) - base_pfa.get('hazard_label', 0):+.4f} "
-                f"| {pfa.get('hazard_present', 0) - base_pfa.get('hazard_present', 0):+.4f} "
-                f"| {pfa.get('zone_relation', 0) - base_pfa.get('zone_relation', 0):+.4f} "
-                f"| {pfa.get('object_state', 0) - base_pfa.get('object_state', 0):+.4f} "
-                f"| {pfa.get('object_direction', 0) - base_pfa.get('object_direction', 0):+.4f} "
-                f"| {hp_f1 - base_hpf1:+.4f} |"
-            )
-        lines.append("")
-
-    # Binary confusion matrices
-    lines.append("## Confusion Matrices (hazard_present)\n")
+    # -------------------------------------------------------------------------
+    # Forklift per-field accuracy
+    # -------------------------------------------------------------------------
+    lines.append("## Forklift Per-Field Accuracy\n")
+    lines.append(
+        "| Model | hazard_label | hazard_present | zone_relation | object_state | object_direction |"
+    )
+    lines.append(
+        "|------|--------------|----------------|---------------|--------------|------------------|"
+    )
     for name, metrics in all_results:
-        hpb = metrics.get("hazard_present_binary", {})
+        pfa = metrics["by_task"]["forklift"]["per_field_accuracy"]
+        lines.append(
+            f"| {name} "
+            f"| {fmt_metric(pfa.get('hazard_label'))} "
+            f"| {fmt_metric(pfa.get('hazard_present'))} "
+            f"| {fmt_metric(pfa.get('zone_relation'))} "
+            f"| {fmt_metric(pfa.get('object_state'))} "
+            f"| {fmt_metric(pfa.get('object_direction'))} |"
+        )
+    lines.append("")
+
+    # -------------------------------------------------------------------------
+    # Robot per-field accuracy
+    # -------------------------------------------------------------------------
+    lines.append("## Robot Per-Field Accuracy\n")
+    lines.append(
+        "| Model | hazard_label | hazard_present | zone_relation | object_state |"
+    )
+    lines.append(
+        "|------|--------------|----------------|---------------|--------------|"
+    )
+    for name, metrics in all_results:
+        pfa = metrics["by_task"]["robot"]["per_field_accuracy"]
+        lines.append(
+            f"| {name} "
+            f"| {fmt_metric(pfa.get('hazard_label'))} "
+            f"| {fmt_metric(pfa.get('hazard_present'))} "
+            f"| {fmt_metric(pfa.get('zone_relation'))} "
+            f"| {fmt_metric(pfa.get('object_state'))} |"
+        )
+    lines.append("")
+
+    # -------------------------------------------------------------------------
+    # Combined per-field macro F1
+    # -------------------------------------------------------------------------
+    lines.append("## Combined Per-Field Macro F1\n")
+    lines.append(
+        "| Model | hazard_label | hazard_present | zone_relation | object_state | object_direction |"
+    )
+    lines.append(
+        "|------|--------------|----------------|---------------|--------------|------------------|"
+    )
+    for name, metrics in all_results:
+        pfm = metrics["combined"]["per_field_metrics"]
+        lines.append(
+            f"| {name} "
+            f"| {fmt_metric(pfm.get('hazard_label', {}).get('macro_f1'))} "
+            f"| {fmt_metric(pfm.get('hazard_present', {}).get('macro_f1'))} "
+            f"| {fmt_metric(pfm.get('zone_relation', {}).get('macro_f1'))} "
+            f"| {fmt_metric(pfm.get('object_state', {}).get('macro_f1'))} "
+            f"| {fmt_metric(pfm.get('object_direction', {}).get('macro_f1'))} |"
+        )
+    lines.append("")
+
+    # -------------------------------------------------------------------------
+    # Binary confusion matrices
+    # -------------------------------------------------------------------------
+    lines.append("## Confusion Matrices (Combined hazard_present)\n")
+    for name, metrics in all_results:
+        hpb = metrics["combined"]["hazard_present_binary"]
         lines.append(f"### {name}\n")
         lines.append("| | Pred YES | Pred NO |")
         lines.append("|---|---------|---------|")
@@ -927,8 +1136,8 @@ def evaluate_named_model(
     print(f"Evaluating: {eval_name}")
     print(f"{'=' * 80}")
 
-    pbar = None
     iterator = enumerate(test_data)
+    pbar = None
     if HAS_TQDM:
         pbar = tqdm(test_data, total=len(test_data), desc=f"Eval {eval_name}", unit="sample")
         iterator = enumerate(pbar)
@@ -941,8 +1150,10 @@ def evaluate_named_model(
         pred_text = ""
         pred_parsed = None
         gt_text = ""
-        gt_parsed = {}
+        gt_parsed: Dict[str, Any] = {}
         inference_time = 0.0
+        task = None
+        task_fields: List[str] = []
 
         try:
             normalized_messages = normalize_messages(
@@ -957,7 +1168,14 @@ def evaluate_named_model(
             if not gt_parsed:
                 gt_parse_failed = True
 
-            # Track Inference Time Start
+            task = infer_task(
+                example=example,
+                prompt_messages=prompt_messages,
+                gt_parsed=gt_parsed,
+                task_mode=args.task_mode,
+            )
+            task_fields = get_fields_for_task(task)
+
             t_inf_start = time.time()
             pred_text = run_inference_single(
                 model=model,
@@ -966,27 +1184,35 @@ def evaluate_named_model(
                 num_frames=args.num_frames,
                 max_new_tokens=args.max_new_tokens,
             )
-            # Track Inference Time End
             inference_time = time.time() - t_inf_start
-            
+
             pred_parsed = canonicalize_prediction_dict(try_parse_json(pred_text))
 
         except Exception as e:
             pred_text = ""
             pred_parsed = None
             inference_time = 0.0
+            if task is None:
+                task = args.task_mode if args.task_mode != "both" else "robot"
+                task_fields = get_fields_for_task(task)
             print(f"\n[ERROR] {eval_name} :: {sample_id} :: {type(e).__name__}: {e}")
 
         field_matches = {}
-        for field in EVAL_FIELDS:
+        for field in ALL_FIELDS:
+            if field not in task_fields:
+                field_matches[field] = None
+                continue
+
             gt_val = gt_parsed.get(field, "__MISSING__")
             pred_val = "__PARSE_FAIL__" if pred_parsed is None else pred_parsed.get(field, "__MISSING__")
             field_matches[field] = (gt_val == pred_val)
 
-        exact_match = all(field_matches.values())
+        exact_match = all(v is True for v in field_matches.values() if v is not None)
 
         result = {
             "sample_id": sample_id,
+            "task": task,
+            "task_fields": task_fields,
             "ground_truth_text": gt_text,
             "ground_truth": gt_parsed,
             "ground_truth_parse_failed": gt_parse_failed,
@@ -994,19 +1220,16 @@ def evaluate_named_model(
             "prediction_parsed": pred_parsed,
             "field_matches": field_matches,
             "exact_match": exact_match,
-            "inference_time_sec": round(inference_time, 4), # NEW FIELD ADDED
+            "inference_time_sec": round(inference_time, 4),
             "hard_negative_bucket": meta.get("hard_negative_bucket"),
             "label_signature": meta.get("label_signature", ""),
             "meta": meta,
         }
-        # Optional: Disable these prints if you find them too noisy for per-sample execution
-        print(gt_parsed)
+        print(gt_text)
         print("")
         print(pred_parsed)
-        print(inference_time)
         sample_results.append(result)
 
-        # Live console line for non-tqdm fallback
         if not HAS_TQDM:
             elapsed = time.time() - t_start
             rate = (i + 1) / elapsed if elapsed > 0 else 0.0
@@ -1016,7 +1239,7 @@ def evaluate_named_model(
             mark = "✓" if exact_match else "✗"
             print(
                 f"[{i+1:3d}/{len(test_data)}] {mark} "
-                f"GT={gt_hp:>3s} PRED={pred_hp:>10s} "
+                f"TASK={task:>8s} GT={gt_hp:>3s} PRED={pred_hp:>10s} "
                 f"({rate:.2f} it/s, ETA {eta:.0f}s) "
                 f"— {sample_id[:60]}"
             )
@@ -1024,6 +1247,7 @@ def evaluate_named_model(
             gt_hp = gt_parsed.get("hazard_present", "?")
             pred_hp = "PARSE_FAIL" if pred_parsed is None else pred_parsed.get("hazard_present", "?")
             pbar.set_postfix({
+                "TASK": task,
                 "GT": gt_hp,
                 "PRED": pred_hp,
                 "Exact": int(exact_match),
@@ -1049,20 +1273,22 @@ def evaluate_named_model(
 
     print(f"\n[INFO] {eval_name} finished in {elapsed_total:.1f}s")
     print(f"[INFO] Results saved to: {out_path}")
-    print(f"[INFO] Exact match: {metrics['exact_match_accuracy']:.4f}")
-    print("[INFO] Per-field accuracy:")
-    for field in EVAL_FIELDS:
-        print(f"  - {field:16s}: {metrics['per_field_accuracy'][field]:.4f}")
 
-    print("[INFO] Per-field macro F1:")
-    for field in EVAL_FIELDS:
-        print(f"  - {field:16s}: {metrics['per_field_metrics'][field]['macro_f1']:.4f}")
+    combined = metrics["combined"]
+    forklift = metrics["by_task"]["forklift"]
+    robot = metrics["by_task"]["robot"]
 
-    hpb = metrics["hazard_present_binary"]
-    print(f"[INFO] hazard_present Precision: {hpb['precision']:.4f}")
-    print(f"[INFO] hazard_present Recall:    {hpb['recall']:.4f}")
-    print(f"[INFO] hazard_present F1:        {hpb['f1']:.4f}")
-    print(f"[INFO] Parse failures:           {metrics['parse_failures']}")
+    print(f"[INFO] Combined exact match:       {fmt_metric(combined['exact_match_accuracy'])}")
+    print(f"[INFO] Combined field accuracy:    {fmt_metric(combined['relevant_field_accuracy'])}")
+    print(f"[INFO] Combined parse failures:    {combined['parse_failures']}")
+    print(f"[INFO] Combined hazard_present F1: {fmt_metric(combined['hazard_present_binary']['f1'])}")
+
+    print("[INFO] Combined per-field accuracy:")
+    for field in ALL_FIELDS:
+        print(f"  - {field:16s}: {fmt_metric(combined['per_field_accuracy'][field])}")
+
+    print(f"[INFO] Forklift exact match:       {fmt_metric(forklift['exact_match_accuracy'])}")
+    print(f"[INFO] Robot exact match:          {fmt_metric(robot['exact_match_accuracy'])}")
 
     return metrics
 
@@ -1083,6 +1309,7 @@ def main() -> None:
     with open(args.test_file, "r", encoding="utf-8") as f:
         test_data = [json.loads(line) for line in f if line.strip()]
     print(f"[INFO] Loaded {len(test_data)} test samples from {args.test_file}")
+    print(f"[INFO] Task mode: {args.task_mode}")
 
     adapters = discover_adapters(args.adapter_dir, args.only_final, args.only_checkpoints)
     adapter_names = [name for name, _ in adapters]
@@ -1094,7 +1321,6 @@ def main() -> None:
     base_model, processor = load_base_model_and_processor(args, dtype)
     all_summaries: List[Tuple[str, Dict[str, Any]]] = []
 
-    # 1) Base pretrained model
     if not args.skip_base_eval:
         base_model.eval()
         base_metrics = evaluate_named_model(
@@ -1107,7 +1333,6 @@ def main() -> None:
         )
         all_summaries.append((args.base_eval_name, base_metrics))
 
-    # 2) Final adapter + checkpoints
     for idx, (adapter_name, adapter_path) in enumerate(adapters, start=1):
         print(f"\n[INFO] Loading adapter {idx}/{len(adapters)}: {adapter_name}")
         model = load_adapter(base_model, adapter_path)
@@ -1125,7 +1350,8 @@ def main() -> None:
 
         del model
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     summary_path = os.path.join(eval_dir, "summary.md")
     write_summary_markdown(all_summaries, summary_path)
