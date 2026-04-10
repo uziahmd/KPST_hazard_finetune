@@ -60,6 +60,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
+import numpy as np
 from dotenv import load_dotenv 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -101,10 +102,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--video_load_backend",
         type=str,
-        default="pyav",
-        choices=["pyav", "decord", "opencv", "torchvision"],
-        help="Video decoder backend passed to processor.apply_chat_template. "
-             "Use this to avoid the default torchcodec path when it is unavailable.",
+        default="torchvision",
+        choices=["torchvision", "pyav"],
+        help="Local decoder backend used to preload raw-video clips in the collator. "
+             "This bypasses Transformers' default torchcodec path for local files.",
     )
     parser.add_argument("--max_new_tokens", type=int, default=128,
                         help="Used only for the post-training demo inference.")
@@ -185,6 +186,96 @@ def resolve_local_media_path(raw_value: str, project_root: Path) -> Path:
     return (project_root / p).resolve()
 
 
+def _sample_indices(total_frames: int, source_fps: Optional[float], num_frames: Optional[int], fps: Optional[float]) -> np.ndarray:
+    if total_frames <= 0:
+        raise ValueError("Decoded video contains no frames.")
+
+    if fps is not None and source_fps is not None and source_fps > 0:
+        step = max(source_fps / fps, 1.0)
+        sampled = np.arange(0, total_frames, step, dtype=float)
+        indices = np.clip(np.round(sampled).astype(int), 0, total_frames - 1)
+        if indices.size == 0:
+            indices = np.array([0], dtype=int)
+        elif indices[-1] != total_frames - 1:
+            indices = np.concatenate([indices, np.array([total_frames - 1], dtype=int)])
+        indices = np.unique(indices)
+    else:
+        indices = np.arange(total_frames, dtype=int)
+
+    if num_frames is not None and len(indices) > num_frames:
+        positions = np.linspace(0, len(indices) - 1, num_frames, dtype=int)
+        indices = indices[positions]
+
+    return indices
+
+
+def _decode_video_torchvision(video_path: Path) -> tuple[np.ndarray, Optional[float]]:
+    try:
+        from torchvision.io import read_video
+    except ImportError as e:
+        raise ImportError("torchvision is required for --video_load_backend torchvision") from e
+
+    try:
+        video, _, info = read_video(str(video_path), pts_unit="sec", output_format="THWC")
+    except TypeError:
+        video, _, info = read_video(str(video_path), pts_unit="sec")
+
+    if isinstance(video, torch.Tensor):
+        video = video.cpu().numpy()
+    else:
+        video = np.asarray(video)
+
+    if video.ndim != 4:
+        raise ValueError(f"Expected decoded video to have 4 dims, got shape {video.shape} for {video_path}")
+
+    # Older torchvision builds may return TCHW.
+    if video.shape[-1] not in (1, 3) and video.shape[1] in (1, 3):
+        video = np.transpose(video, (0, 2, 3, 1))
+
+    source_fps = info.get("video_fps") if isinstance(info, dict) else None
+    if source_fps is not None:
+        source_fps = float(source_fps)
+    return video, source_fps
+
+
+def _decode_video_pyav(video_path: Path) -> tuple[np.ndarray, Optional[float]]:
+    try:
+        import av
+    except ImportError as e:
+        raise ImportError("PyAV is required for --video_load_backend pyav") from e
+
+    container = av.open(str(video_path))
+    try:
+        stream = container.streams.video[0]
+        source_fps = float(stream.average_rate) if stream.average_rate is not None else None
+        frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
+    finally:
+        container.close()
+
+    if not frames:
+        raise ValueError(f"No video frames decoded from {video_path}")
+
+    return np.stack(frames), source_fps
+
+
+def decode_local_video(
+    video_path: Path,
+    *,
+    num_frames: Optional[int],
+    fps: Optional[float],
+    backend: str,
+) -> np.ndarray:
+    if backend == "torchvision":
+        video, source_fps = _decode_video_torchvision(video_path)
+    elif backend == "pyav":
+        video, source_fps = _decode_video_pyav(video_path)
+    else:
+        raise ValueError(f"Unsupported local video backend: {backend}")
+
+    indices = _sample_indices(video.shape[0], source_fps, num_frames, fps)
+    return np.ascontiguousarray(video[indices])
+
+
 def absolutize_multimodal_paths(messages: List[Dict[str, Any]], project_root: Path) -> List[Dict[str, Any]]:
     messages = copy.deepcopy(messages)
 
@@ -225,6 +316,41 @@ def absolutize_multimodal_paths(messages: List[Dict[str, Any]], project_root: Pa
     return messages
 
 
+def materialize_local_videos(
+    messages: List[Dict[str, Any]],
+    *,
+    num_frames: Optional[int],
+    fps: Optional[float],
+    backend: str,
+) -> List[Dict[str, Any]]:
+    messages = copy.deepcopy(messages)
+
+    for msg in messages:
+        content = msg.get("content", [])
+        if not isinstance(content, list):
+            continue
+
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "video":
+                continue
+
+            raw_video = item.get("video", item.get("path"))
+            if isinstance(raw_video, str) and raw_video and not is_probably_url(raw_video):
+                video_path = Path(raw_video)
+                if not video_path.exists():
+                    raise FileNotFoundError(f"Video file not found: {video_path}")
+                item["video"] = decode_local_video(
+                    video_path,
+                    num_frames=num_frames,
+                    fps=fps,
+                    backend=backend,
+                )
+                item.pop("path", None)
+                item.pop("url", None)
+
+    return messages
+
+
 def extract_assistant_text(message: Dict[str, Any]) -> str:
     if message["role"] != "assistant":
         raise ValueError("Expected an assistant message.")
@@ -252,7 +378,6 @@ def apply_chat_template_gemma(
     add_generation_prompt: bool,
     num_frames: Optional[int] = None,
     fps: Optional[float] = None,
-    video_load_backend: Optional[str] = None,
 ):
     """
     Use Gemma's native multimodal chat template path for raw-video messages.
@@ -273,9 +398,6 @@ def apply_chat_template_gemma(
         processor_kwargs["num_frames"] = num_frames
     if fps is not None:
         processor_kwargs["fps"] = fps
-    if video_load_backend is not None:
-        processor_kwargs["video_load_backend"] = video_load_backend
-
     if processor_kwargs:
         attempts.append({**base_kwargs, "enable_thinking": False, "processor_kwargs": processor_kwargs})
         attempts.append({**base_kwargs, "processor_kwargs": processor_kwargs})
@@ -311,7 +433,7 @@ class RawVideoGemmaCollator:
         project_root: str,
         num_frames: int,
         fps: Optional[float],
-        video_load_backend: Optional[str],
+        video_load_backend: str,
     ):
         self.processor = processor
         self.project_root = Path(project_root)
@@ -333,6 +455,12 @@ class RawVideoGemmaCollator:
 
         example = examples[0]
         messages = absolutize_multimodal_paths(example["messages"], self.project_root)
+        messages = materialize_local_videos(
+            messages,
+            num_frames=self.num_frames,
+            fps=self.fps,
+            backend=self.video_load_backend,
+        )
 
         if not messages or messages[-1]["role"] != "assistant":
             raise ValueError("Each example must end with an assistant message.")
@@ -344,17 +472,11 @@ class RawVideoGemmaCollator:
             self.processor,
             full_messages,
             add_generation_prompt=False,
-            num_frames=self.num_frames,
-            fps=self.fps,
-            video_load_backend=self.video_load_backend,
         )
         prompt_batch = apply_chat_template_gemma(
             self.processor,
             prompt_messages,
             add_generation_prompt=True,
-            num_frames=self.num_frames,
-            fps=self.fps,
-            video_load_backend=self.video_load_backend,
         )
 
         labels = full_batch["input_ids"].clone()
@@ -514,12 +636,18 @@ def run_one_inference_example(
     project_root: str,
     num_frames: int,
     fps: Optional[float],
-    video_load_backend: Optional[str],
+    video_load_backend: str,
     max_new_tokens: int,
 ) -> None:
     model.eval()
 
     messages = absolutize_multimodal_paths(example["messages"], Path(project_root))
+    messages = materialize_local_videos(
+        messages,
+        num_frames=num_frames,
+        fps=fps,
+        backend=video_load_backend,
+    )
     prompt_messages = messages[:-1]
     ground_truth = extract_assistant_text(messages[-1])
 
@@ -527,9 +655,6 @@ def run_one_inference_example(
         processor,
         prompt_messages,
         add_generation_prompt=True,
-        num_frames=num_frames,
-        fps=fps,
-        video_load_backend=video_load_backend,
     )
 
     device = next(model.parameters()).device
