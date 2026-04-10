@@ -66,7 +66,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from datasets import load_dataset
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, cast_mixed_precision_params, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
     AutoModelForMultimodalLM,
     AutoProcessor,
@@ -145,8 +145,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--modules_to_save",
         type=str,
-        default="lm_head,embed_tokens",
-        help='Comma-separated PEFT modules_to_save. Use "" to disable.',
+        default="",
+        help='Comma-separated PEFT modules_to_save. Use "" to disable. '
+             "Defaults to disabled so this stays a true LoRA run on limited VRAM.",
     )
 
     parser.add_argument("--report_to", type=str, default="none")
@@ -584,6 +585,17 @@ def load_model_and_processor(args: argparse.Namespace, dtype: torch.dtype):
 
     model = get_peft_model(model, lora_config)
 
+    # For AMP training, keep frozen weights in low precision and cast trainable
+    # adapter params to full precision. PEFT documents this as the expected setup
+    # for mixed-precision LoRA training stability.
+    if dtype in (torch.float16, torch.bfloat16):
+        try:
+            cast_mixed_precision_params(model, dtype=dtype)
+        except Exception:
+            for param in model.parameters():
+                if param.requires_grad:
+                    param.data = param.data.float()
+
     if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         try:
             model.gradient_checkpointing_enable()
@@ -725,6 +737,8 @@ def main():
 
     if not args.load_in_4bit:
         print("[WARN] You are not using --load_in_4bit. On a V100 this may be too heavy for Gemma 4 E4B-it.")
+    if args.modules_to_save.strip():
+        print(f"[WARN] modules_to_save={args.modules_to_save!r} will train full modules in addition to LoRA adapters.")
 
     model, processor = load_model_and_processor(args, dtype)
 
