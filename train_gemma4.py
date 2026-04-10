@@ -39,6 +39,7 @@ python train_gemma4.py \
   --project_root hazard_finetuning \
   --model_name_or_path google/gemma-4-E4B-it \
   --output_dir runs/gemma4_e4b_video_lora \
+  --video_load_backend pyav \
   --fps 1 \
   --per_device_train_batch_size 1 \
   --per_device_eval_batch_size 1 \
@@ -97,6 +98,14 @@ def parse_args() -> argparse.Namespace:
                         help="Requested frame count for video processing if the processor version supports it.")
     parser.add_argument("--fps", type=float, default=None,
                         help="Optional target frames-per-second for processor-side video sampling.")
+    parser.add_argument(
+        "--video_load_backend",
+        type=str,
+        default="pyav",
+        choices=["pyav", "decord", "opencv", "torchvision"],
+        help="Video decoder backend passed to processor.apply_chat_template. "
+             "Use this to avoid the default torchcodec path when it is unavailable.",
+    )
     parser.add_argument("--max_new_tokens", type=int, default=128,
                         help="Used only for the post-training demo inference.")
     parser.add_argument("--inference_index", type=int, default=0)
@@ -158,6 +167,24 @@ def is_probably_url(path_str: str) -> bool:
     return parsed.scheme in {"http", "https", "s3", "gs"}
 
 
+def resolve_local_media_path(raw_value: str, project_root: Path) -> Path:
+    p = Path(raw_value)
+    if p.is_absolute():
+        return p
+
+    candidates = [
+        project_root / p,
+        Path.cwd() / p,
+        p,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+
+    # Fall back to the project-root-relative location for a deterministic path.
+    return (project_root / p).resolve()
+
+
 def absolutize_multimodal_paths(messages: List[Dict[str, Any]], project_root: Path) -> List[Dict[str, Any]]:
     messages = copy.deepcopy(messages)
 
@@ -170,21 +197,30 @@ def absolutize_multimodal_paths(messages: List[Dict[str, Any]], project_root: Pa
             if not isinstance(item, dict):
                 continue
 
-            # Handle local video paths
-            if item.get("type") == "video" and "video" in item:
-                raw_value = item["video"]
-                if isinstance(raw_value, str) and raw_value and not is_probably_url(raw_value):
-                    p = Path(raw_value)
-                    if not p.is_absolute():
-                        item["video"] = str((project_root / p).resolve())
+            # Normalize repo-local shorthand into the multimodal HF schema:
+            # {"type": "video", "video": "..."} -> {"type": "video", "path": "..."}
+            # {"type": "image", "image": "..."} -> {"type": "image", "path": "..."}
+            if item.get("type") == "video":
+                raw_value = item.get("path", item.get("video"))
+                if isinstance(raw_value, str) and raw_value:
+                    if is_probably_url(raw_value):
+                        item["url"] = raw_value
+                        item.pop("path", None)
+                    else:
+                        item["path"] = str(resolve_local_media_path(raw_value, project_root))
+                        item.pop("url", None)
+                item.pop("video", None)
 
-            # Handle local image paths if they ever appear later
-            if item.get("type") == "image" and "image" in item:
-                raw_value = item["image"]
-                if isinstance(raw_value, str) and raw_value and not is_probably_url(raw_value):
-                    p = Path(raw_value)
-                    if not p.is_absolute():
-                        item["image"] = str((project_root / p).resolve())
+            if item.get("type") == "image":
+                raw_value = item.get("path", item.get("image"))
+                if isinstance(raw_value, str) and raw_value:
+                    if is_probably_url(raw_value):
+                        item["url"] = raw_value
+                        item.pop("path", None)
+                    else:
+                        item["path"] = str(resolve_local_media_path(raw_value, project_root))
+                        item.pop("url", None)
+                item.pop("image", None)
 
     return messages
 
@@ -216,6 +252,7 @@ def apply_chat_template_gemma(
     add_generation_prompt: bool,
     num_frames: Optional[int] = None,
     fps: Optional[float] = None,
+    video_load_backend: Optional[str] = None,
 ):
     """
     Use Gemma's native multimodal chat template path for raw-video messages.
@@ -227,6 +264,8 @@ def apply_chat_template_gemma(
         return_tensors="pt",
         add_generation_prompt=add_generation_prompt,
     )
+    if video_load_backend is not None:
+        base_kwargs["video_load_backend"] = video_load_backend
 
     attempts = []
 
@@ -266,11 +305,19 @@ class RawVideoGemmaCollator:
     Use gradient accumulation for larger effective batch size.
     """
 
-    def __init__(self, processor, project_root: str, num_frames: int, fps: Optional[float]):
+    def __init__(
+        self,
+        processor,
+        project_root: str,
+        num_frames: int,
+        fps: Optional[float],
+        video_load_backend: Optional[str],
+    ):
         self.processor = processor
         self.project_root = Path(project_root)
         self.num_frames = num_frames
         self.fps = fps
+        self.video_load_backend = video_load_backend
 
         if self.processor.tokenizer.pad_token is None:
             self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
@@ -299,6 +346,7 @@ class RawVideoGemmaCollator:
             add_generation_prompt=False,
             num_frames=self.num_frames,
             fps=self.fps,
+            video_load_backend=self.video_load_backend,
         )
         prompt_batch = apply_chat_template_gemma(
             self.processor,
@@ -306,6 +354,7 @@ class RawVideoGemmaCollator:
             add_generation_prompt=True,
             num_frames=self.num_frames,
             fps=self.fps,
+            video_load_backend=self.video_load_backend,
         )
 
         labels = full_batch["input_ids"].clone()
@@ -357,7 +406,7 @@ def load_model_and_processor(args: argparse.Namespace, dtype: torch.dtype):
         )
         model_kwargs["quantization_config"] = quantization_config
     else:
-        model_kwargs["torch_dtype"] = dtype
+        model_kwargs["dtype"] = dtype
 
     model = AutoModelForMultimodalLM.from_pretrained(
         args.model_name_or_path,
@@ -465,6 +514,7 @@ def run_one_inference_example(
     project_root: str,
     num_frames: int,
     fps: Optional[float],
+    video_load_backend: Optional[str],
     max_new_tokens: int,
 ) -> None:
     model.eval()
@@ -479,6 +529,7 @@ def run_one_inference_example(
         add_generation_prompt=True,
         num_frames=num_frames,
         fps=fps,
+        video_load_backend=video_load_backend,
     )
 
     device = next(model.parameters()).device
@@ -535,6 +586,7 @@ def main():
         project_root=args.project_root,
         num_frames=args.num_frames,
         fps=args.fps,
+        video_load_backend=args.video_load_backend,
     )
 
     # Disable eval if val file is absent
@@ -565,6 +617,7 @@ def main():
         project_root=args.project_root,
         num_frames=args.num_frames,
         fps=args.fps,
+        video_load_backend=args.video_load_backend,
         max_new_tokens=args.max_new_tokens,
     )
 
