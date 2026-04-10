@@ -264,8 +264,6 @@ def apply_chat_template_gemma(
         return_tensors="pt",
         add_generation_prompt=add_generation_prompt,
     )
-    if video_load_backend is not None:
-        base_kwargs["video_load_backend"] = video_load_backend
 
     attempts = []
 
@@ -275,6 +273,8 @@ def apply_chat_template_gemma(
         processor_kwargs["num_frames"] = num_frames
     if fps is not None:
         processor_kwargs["fps"] = fps
+    if video_load_backend is not None:
+        processor_kwargs["video_load_backend"] = video_load_backend
 
     if processor_kwargs:
         attempts.append({**base_kwargs, "enable_thinking": False, "processor_kwargs": processor_kwargs})
