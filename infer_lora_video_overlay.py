@@ -10,6 +10,25 @@ Pipeline:
 5. Save structured inference results to JSON.
 6. Render per-chunk overlays with ffmpeg.
 7. Concatenate annotated chunks back into final videos.
+
+run:
+python infer_lora_video_overlay.py \
+  --base_model Qwen/Qwen3.5-9B \
+  --adapter_dir runs/qwen35_9b_both_aug/checkpoint-4796 \
+  --video_dir test \
+  --output_dir runs/infer_overlay_run \
+  --task_mode both \
+  --robot_prompt_file prompts/robot_propmt_v1.txt \
+  --fork_prompt_file prompts/fork_prompt_v2.txt \
+  --chunk_sec 5 \
+  --num_frames 12 \
+  --max_new_tokens 256 \
+  --temperature 0.0 \
+  --no-do_sample \
+  --device cuda:0 \
+  --save_chunks \
+  --save_overlay
+
 """
 
 from __future__ import annotations
@@ -22,6 +41,7 @@ import math
 import os
 import shutil
 import subprocess
+import dotenv
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,18 +57,26 @@ try:
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     try:
-        from transformers import AutoModelForMultimodalLM  # type: ignore
+        from transformers import AutoModelForMultimodalLM  
     except ImportError:
-        AutoModelForMultimodalLM = None  # type: ignore
+        AutoModelForMultimodalLM = None  
 except Exception as exc:
     IMPORT_ERROR = exc
-    np = None  # type: ignore
-    torch = None  # type: ignore
-    PeftModel = None  # type: ignore
-    AutoProcessor = None  # type: ignore
-    AutoModelForImageTextToText = None  # type: ignore
-    AutoModelForMultimodalLM = None  # type: ignore
+    np = None  
+    torch = None  
+    PeftModel = None  
+    AutoProcessor = None  
+    AutoModelForImageTextToText = None  
+    AutoModelForMultimodalLM = None  
 
+# Load variables from .env into os.environ
+load_dotenv(override=True)
+
+# Verification (Optional: remove this in production)
+if os.getenv("HF_TOKEN"):
+    print("HF_TOKEN successfully loaded from .env")
+else:
+    print("Warning: HF_TOKEN not found in .env")
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 TASK_PREFIX_MAP = {
