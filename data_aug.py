@@ -379,6 +379,39 @@ def get_assistant_text(record):
     return json.dumps(record, ensure_ascii=False)
 
 
+def get_user_text(record):
+    messages = record.get("messages", [])
+    if isinstance(messages, list):
+        for msg in messages:
+            role = msg.get("role", "") or msg.get("from", "")
+            if str(role).lower() not in {"user", "human"}:
+                continue
+
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get("type") == "text" and "text" in item:
+                            parts.append(str(item["text"]))
+                        elif "value" in item:
+                            parts.append(str(item["value"]))
+                if parts:
+                    return "\n".join(parts)
+
+    conversations = record.get("conversations", [])
+    if isinstance(conversations, list):
+        for msg in conversations:
+            if str(msg.get("from", "")).lower() in {"user", "human"}:
+                value = msg.get("value", "")
+                if isinstance(value, str):
+                    return value
+
+    return ""
+
+
 def get_parsed_assistant_json(record):
     assistant_text = get_assistant_text(record)
     parsed = parse_possible_json(assistant_text)
@@ -408,6 +441,47 @@ def get_zone_relation(record):
 
 def should_create_night_version(record):
     return get_zone_relation(record) in NIGHT_AUG_ZONE_RELATIONS
+
+
+def get_record_task(record):
+    direct_task = str(record.get("task", "")).strip().lower()
+    if direct_task in {"robot", "forklift"}:
+        return direct_task
+
+    meta = record.get("meta", {})
+    if isinstance(meta, dict):
+        meta_task = str(meta.get("task", "")).strip().lower()
+        if meta_task in {"robot", "forklift"}:
+            return meta_task
+
+        for key in ["source_video_id", "sample_id"]:
+            value = str(meta.get(key, "")).strip().lower()
+            if value.startswith("robot_"):
+                return "robot"
+            if value.startswith("fork_"):
+                return "forklift"
+
+    for key in ["sample_id", "id"]:
+        value = str(record.get(key, "")).strip().lower()
+        if value.startswith("robot_"):
+            return "robot"
+        if value.startswith("fork_"):
+            return "forklift"
+
+    video_path = get_video_path(record).lower()
+    video_name = Path(video_path).name
+    if video_name.startswith("robot_"):
+        return "robot"
+    if video_name.startswith("fork_"):
+        return "forklift"
+
+    user_text = get_user_text(record).lower()
+    if "target object: robot arm or machine" in user_text or "unsafe_machine_proximity" in user_text:
+        return "robot"
+    if "target object: forklift" in user_text or "unsafe_forklift_approach" in user_text:
+        return "forklift"
+
+    return ""
 
 
 def get_video_path(record):
@@ -595,8 +669,9 @@ def main():
     hazard_families = processed_hazard_families
     print(f"Kept {len(hazard_families)} hazard families after file validation.")
 
-    print("\n3. Processing Clean Data as Families (copy + selective night aug)...")
+    print("\n3. Processing Clean Data as Families (copy + robot tilt/bc + selective night aug)...")
     processed_clean_families = []
+    robot_aug_count = 0
     night_aug_count = 0
     
     for record in clean_records:
@@ -629,6 +704,23 @@ def main():
         new_record.pop("_source_jsonl", None)
         family.append(new_record)
     
+        task = get_record_task(record)
+
+        if task == "robot":
+            for aug in ["tilt", "bc"]:
+                aug_vid_path = os.path.join(OUTPUT_VIDEOS_DIR, f"{base_stem}_aug_{aug}.mp4")
+
+                if not os.path.exists(aug_vid_path):
+                    ok = augment_video_with_ffmpeg_match(resolved_video_path, aug_vid_path, aug)
+                    if not ok:
+                        print(f"Warning: augmentation failed for {resolved_video_path} [{aug}]")
+                        continue
+
+                aug_record = set_video_path(record, aug_vid_path)
+                aug_record.pop("_source_jsonl", None)
+                family.append(aug_record)
+                robot_aug_count += 1
+
         if should_create_night_version(record):
             night_vid_path = os.path.join(OUTPUT_VIDEOS_DIR, f"{base_stem}_aug_night.mp4")
     
@@ -651,6 +743,7 @@ def main():
     
     clean_families = processed_clean_families
     print(f"Kept {len(clean_families)} clean families after file validation.")
+    print(f"Created {robot_aug_count} robot tilt/bc clean augmentations.")
     print(f"Created {night_aug_count} selective night-augmented clean records.")
 
     print("\n4. Shuffling and Splitting Data Safely...")
