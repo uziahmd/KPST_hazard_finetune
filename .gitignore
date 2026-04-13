@@ -32,3 +32,4 @@ vlm_dataset/
 vlm_dataset_*/
 runs/
 .tmp_*/
+test/

@@ -33,23 +33,24 @@ Expected row format:
 
 Example run:
 python train_gemma4.py \
-  --train_file vlm_dataset_both_aug/train_chat.jsonl \
-  --val_file   vlm_dataset_both_aug/val_chat.jsonl \
-  --test_file  vlm_dataset_both_aug/test_chat.jsonl \
-  --project_root hazard_finetuning \
-  --model_name_or_path google/gemma-4-E4B-it \
-  --output_dir runs/gemma4_e4b_video_lora \
-  --video_load_backend pyav \
-  --fps 1 \
-  --per_device_train_batch_size 1 \
-  --per_device_eval_batch_size 1 \
-  --gradient_accumulation_steps 8 \
-  --num_train_epochs 3 \
-  --learning_rate 1e-4 \
-  --warmup_ratio 0.10 \
-  --weight_decay 0.01 \
-  --gradient_checkpointing \
-  --use_fp16
+>   --train_file vlm_dataset_both_aug/train_chat.jsonl \
+>   --val_file vlm_dataset_both_aug/val_chat.jsonl \
+>   --test_file vlm_dataset_both_aug/test_chat.jsonl \
+>   --project_root . \
+>   --model_name_or_path google/gemma-4-E4B-it \
+>   --output_dir runs/gemma4_e4b_video_lora \
+>   --video_load_backend torchvision \
+>   --num_frames 8 \
+>   --fps 1 \
+>   --per_device_train_batch_size 1 \
+>   --per_device_eval_batch_size 1 \
+>   --gradient_accumulation_steps 8 \
+>   --num_train_epochs 3 \
+>   --learning_rate 1e-4 \
+>   --warmup_ratio 0.10 \
+>   --weight_decay 0.01 \
+>   --gradient_checkpointing \
+>   --use_fp16
 """
 
 import argparse
