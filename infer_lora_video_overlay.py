@@ -906,7 +906,7 @@ def normalize_overlay_value(value: Any) -> str:
     return str(value)
 
 
-def build_overlay_lines(chunk_result: Dict[str, Any]) -> Tuple[List[str], Optional[int]]:
+def build_overlay_lines(chunk_result: Dict[str, Any]) -> Tuple[List[str], bool]:
     task = chunk_result["task"]
     fields = TASK_REQUIRED_FIELDS[task]
     parsed = chunk_result.get("parsed_response")
@@ -922,18 +922,11 @@ def build_overlay_lines(chunk_result: Dict[str, Any]) -> Tuple[List[str], Option
         for field in fields:
             lines.append(f"{field}: missing")
 
-    hazard_line_index = None
-    hazard_value = None
+    hazard_present_yes = False
     if isinstance(parsed, dict):
-        hazard_value = str(parsed.get("hazard_present", "")).strip().lower()
+        hazard_present_yes = str(parsed.get("hazard_present", "")).strip().lower() == "yes"
 
-    if hazard_value == "yes":
-        for index, line in enumerate(lines):
-            if line.startswith("hazard_present:"):
-                hazard_line_index = index
-                break
-
-    return lines, hazard_line_index
+    return lines, hazard_present_yes
 
 
 def detect_font_file(user_font: str = "") -> Path:
@@ -1004,7 +997,7 @@ def render_annotated_chunk(
     logger: logging.Logger,
 ) -> None:
     width, height = ffprobe_size(input_chunk)
-    lines, hazard_line_index = build_overlay_lines(chunk_result)
+    lines, hazard_present_yes = build_overlay_lines(chunk_result)
     layout = compute_overlay_layout(width, height, len(lines))
 
     with tempfile.TemporaryDirectory(prefix="overlay_lines_") as temp_dir_name:
@@ -1028,7 +1021,7 @@ def render_annotated_chunk(
 
         for line_index, line_file in enumerate(line_files):
             line_y = layout["text_y"] + line_index * layout["line_h"]
-            font_color = "red" if hazard_line_index == line_index else "white"
+            font_color = "red" if hazard_present_yes else "white"
             filters.append(
                 "drawtext="
                 f"fontfile='{escape_ffmpeg_path(font_file)}':"
@@ -1065,9 +1058,7 @@ def render_annotated_chunk(
             "-pix_fmt",
             "yuv420p",
             "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
+            "copy",
             "-movflags",
             "+faststart",
             str(output_chunk),
@@ -1077,7 +1068,12 @@ def render_annotated_chunk(
             raise RuntimeError(f"ffmpeg overlay failed for {input_chunk.name}: {result.stderr.strip()}")
 
 
-def concatenate_chunks(chunk_paths: List[Path], output_path: Path, logger: logging.Logger) -> None:
+def concatenate_chunks(
+    chunk_paths: List[Path],
+    output_path: Path,
+    logger: logging.Logger,
+    expected_size: Optional[Tuple[int, int]] = None,
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="concat_list_") as temp_dir_name:
@@ -1115,6 +1111,18 @@ def concatenate_chunks(chunk_paths: List[Path], output_path: Path, logger: loggi
             "0",
             "-i",
             str(concat_file),
+        ]
+        if expected_size is not None:
+            expected_width, expected_height = expected_size
+            reencode_cmd.extend([
+                "-vf",
+                (
+                    f"scale={expected_width}:{expected_height}:force_original_aspect_ratio=decrease,"
+                    f"pad={expected_width}:{expected_height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+                ),
+            ])
+
+        reencode_cmd.extend([
             "-c:v",
             "libx264",
             "-preset",
@@ -1130,7 +1138,7 @@ def concatenate_chunks(chunk_paths: List[Path], output_path: Path, logger: loggi
             "-movflags",
             "+faststart",
             str(output_path),
-        ]
+        ])
         reencode_result = run_cmd(reencode_cmd, logger=logger)
         if reencode_result.returncode != 0:
             raise RuntimeError(
@@ -1417,7 +1425,12 @@ def main() -> None:
         if annotated_chunk_paths:
             final_video_path = output_paths["overlays_dir"] / f"{video_path.stem}_annotated.mp4"
             try:
-                concatenate_chunks(annotated_chunk_paths, final_video_path, logger)
+                concatenate_chunks(
+                    annotated_chunk_paths,
+                    final_video_path,
+                    logger,
+                    expected_size=ffprobe_size(video_path),
+                )
                 video_record["annotated_video_path"] = str(final_video_path.resolve())
             except Exception as exc:
                 logger.exception("Final concatenation failed for %s", video_path.name)
