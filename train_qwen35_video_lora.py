@@ -69,7 +69,7 @@ import argparse
 import copy
 import inspect
 import os
-import os
+from pathlib import Path
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from typing import Any, Dict, List, Optional
@@ -85,6 +85,11 @@ from transformers import (
     Trainer,
     TrainingArguments,
     set_seed,
+)
+from training_pause_resume import (
+    PauseResumeManager,
+    create_pause_resume_callback,
+    resolve_resume_checkpoint,
 )
 
 # Load variables from .env into os.environ
@@ -149,6 +154,23 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--report_to", type=str, default="none")
     parser.add_argument("--inference_index", type=int, default=0, help="Test sample index for the post-training demo.")
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default="",
+        help="Trainer checkpoint directory to resume from. Use 'last' to resume from the latest complete checkpoint in output_dir.",
+    )
+    parser.add_argument(
+        "--pause_file",
+        type=str,
+        default="",
+        help="Optional control file. Create this file while training is running to request a safe pause at the next optimizer-step boundary.",
+    )
+    parser.add_argument(
+        "--pause_on_interrupt",
+        action="store_true",
+        help="Treat Ctrl+C as a safe pause request. Training will finish the current optimizer step, save a full checkpoint, and exit cleanly.",
+    )
     return parser.parse_args()
 
 
@@ -413,6 +435,8 @@ def make_training_arguments(args: argparse.Namespace, dtype: torch.dtype) -> Tra
         "report_to": [] if args.report_to == "none" else args.report_to,
         "optim": "paged_adamw_8bit" if args.load_in_4bit else "adamw_torch",
     }
+    if "ignore_data_skip" in sig:
+        common_kwargs["ignore_data_skip"] = False
 
     if args.save_strategy == "steps":
         common_kwargs["save_steps"] = args.save_steps
@@ -511,6 +535,28 @@ def main() -> None:
         num_frames=args.num_frames,
     )
 
+    pause_manager = None
+    trainer_callbacks = []
+    if args.pause_file or args.pause_on_interrupt or args.resume_from_checkpoint:
+        pause_manager = PauseResumeManager(
+            output_dir=args.output_dir,
+            pause_request_path=args.pause_file or None,
+            pause_on_interrupt=args.pause_on_interrupt,
+        )
+        resume_checkpoint, resume_warnings = resolve_resume_checkpoint(
+            output_dir=args.output_dir,
+            resume_from_checkpoint=args.resume_from_checkpoint,
+            state_path=str(pause_manager.state_path),
+        )
+        pause_manager.resume_checkpoint = Path(resume_checkpoint).resolve() if resume_checkpoint else None
+        for warning in resume_warnings:
+            print(warning)
+        for line in pause_manager.describe_startup():
+            print(line)
+        trainer_callbacks.append(create_pause_resume_callback(pause_manager))
+    else:
+        resume_checkpoint = None
+
     training_args = make_training_arguments(args, dtype)
 
     # Use val split for in-training eval when available.
@@ -526,15 +572,35 @@ def main() -> None:
         train_dataset=dataset["train"],
         eval_dataset=eval_ds,
         data_collator=collator,
+        callbacks=trainer_callbacks,
     )
 
-    trainer.train()
+    train_kwargs = {}
+    if resume_checkpoint:
+        train_kwargs["resume_from_checkpoint"] = resume_checkpoint
+
+    if pause_manager is not None:
+        with pause_manager.signal_handlers():
+            trainer.train(**train_kwargs)
+    else:
+        trainer.train(**train_kwargs)
+
+    if pause_manager is not None and pause_manager.pause_armed:
+        paused_checkpoint = pause_manager.finalize_pause(trainer.state)
+        print(
+            f"[Pause/Resume] Training paused safely at global step {trainer.state.global_step}. "
+            f"Resume with --resume_from_checkpoint last. Checkpoint: {paused_checkpoint}"
+        )
+        return
 
     # Saves the LoRA adapter.
     trainer.save_model(args.output_dir)
 
     # Saves tokenizer + video/image processor config locally.
     processor.save_pretrained(args.output_dir)
+
+    if pause_manager is not None:
+        pause_manager.finalize_completion(trainer.state)
 
     demo_idx = max(0, min(args.inference_index, len(dataset["test"]) - 1))
     run_one_inference_example(
