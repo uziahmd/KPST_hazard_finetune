@@ -85,24 +85,24 @@ run_cmd python train_qwen35_video_lora.py \
   --val_file vlm_dataset_both_aug/val_chat.jsonl \
   --test_file vlm_dataset_both_aug/test_chat.jsonl \
   --model_name_or_path Qwen/Qwen3.5-9B \
-  --output_dir runs/qwen35_9b_both_aug \
+  --output_dir runs/qwen35_9b_both_aug_2 \
   --num_frames 12 \
-  --per_device_train_batch_size 1 \
-  --gradient_accumulation_steps 8 \
-  --num_train_epochs 20 \
+  --per_device_train_batch_size 4 \
+  --gradient_accumulation_steps 16 \
+  --num_train_epochs 9 \
   --learning_rate 1e-4 \
   --warmup_ratio 0.10 \
   --weight_decay 0.01 \
-  --lora_r 16 \
-  --lora_alpha 32 \
+  --lora_r 32 \
+  --lora_alpha 64 \
   --lora_dropout 0.05 \
   --lora_target_modules "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
   --gradient_checkpointing \
   --use_fp16 \
   --eval_strategy epoch \
   --save_strategy epoch \
-  --save_total_limit 20 \
-  --attn_implementation eager \
+  --save_total_limit 9 \
+  --attn_implementation sdpa \
   --seed 3407
 
 garbage_clean
