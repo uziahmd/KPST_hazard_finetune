@@ -33,6 +33,7 @@ python infer_lora_video_overlay.py \
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import copy
 import json
 import logging
@@ -40,42 +41,22 @@ import math
 import os
 import shutil
 import subprocess
-from dotenv import load_dotenv
 import tempfile
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
+from dotenv import load_dotenv
+
 IMPORT_ERROR: Optional[Exception] = None
-
-try:
-    import numpy as np
-    import torch
-    from peft import PeftModel
-    from transformers import AutoModelForImageTextToText, AutoProcessor
-
-    try:
-        from transformers import AutoModelForMultimodalLM  
-    except ImportError:
-        AutoModelForMultimodalLM = None  
-except Exception as exc:
-    IMPORT_ERROR = exc
-    np = None  
-    torch = None  
-    PeftModel = None  
-    AutoProcessor = None  
-    AutoModelForImageTextToText = None  
-    AutoModelForMultimodalLM = None  
-
-# Load variables from .env into os.environ
-load_dotenv(override=True)
-
-# Verification (Optional: remove this in production)
-if os.getenv("HF_TOKEN"):
-    print("HF_TOKEN successfully loaded from .env")
-else:
-    print("Warning: HF_TOKEN not found in .env")
+np = None
+torch = None
+PeftModel = None
+AutoProcessor = None
+AutoModelForImageTextToText = None
+AutoModelForMultimodalLM = None
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 TASK_PREFIX_MAP = {
@@ -97,6 +78,52 @@ TASK_REQUIRED_FIELDS = {
         "object_direction",
     ],
 }
+
+
+def ensure_ml_dependencies() -> None:
+    global IMPORT_ERROR, np, torch, PeftModel, AutoProcessor, AutoModelForImageTextToText, AutoModelForMultimodalLM
+
+    if torch is not None and np is not None and PeftModel is not None and AutoProcessor is not None:
+        return
+
+    try:
+        import numpy as _np
+        import torch as _torch
+        from peft import PeftModel as _PeftModel
+        from transformers import AutoModelForImageTextToText as _AutoModelForImageTextToText
+        from transformers import AutoProcessor as _AutoProcessor
+
+        try:
+            from transformers import AutoModelForMultimodalLM as _AutoModelForMultimodalLM
+        except ImportError:
+            _AutoModelForMultimodalLM = None
+    except Exception as exc:
+        IMPORT_ERROR = exc
+        raise ImportError(
+            "Missing runtime dependencies. Install torch, transformers, peft, and numpy before running inference."
+        ) from exc
+
+    np = _np
+    torch = _torch
+    PeftModel = _PeftModel
+    AutoProcessor = _AutoProcessor
+    AutoModelForImageTextToText = _AutoModelForImageTextToText
+    AutoModelForMultimodalLM = _AutoModelForMultimodalLM
+
+
+def initialize_environment(logger: Optional[logging.Logger] = None) -> None:
+    load_dotenv(override=True)
+    if logger is None:
+        return
+
+    if os.getenv("HF_TOKEN"):
+        logger.info("HF_TOKEN successfully loaded from environment/.env")
+    else:
+        logger.warning("HF_TOKEN not found in environment/.env")
+
+
+def default_overlay_workers() -> int:
+    return max(1, min(4, os.cpu_count() or 1))
 
 
 def parse_args() -> argparse.Namespace:
@@ -159,6 +186,30 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Optional font file for ffmpeg drawtext. Auto-detected when omitted.",
+    )
+    parser.add_argument(
+        "--overlay_workers",
+        type=int,
+        default=default_overlay_workers(),
+        help="Number of parallel worker processes for overlay rendering.",
+    )
+    parser.add_argument(
+        "--skip_inference",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip chunking and model inference and reuse an existing results JSON.",
+    )
+    parser.add_argument(
+        "--skip_overlay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip overlay rendering and final annotated video concatenation.",
+    )
+    parser.add_argument(
+        "--results_json",
+        type=str,
+        default="",
+        help="Optional path for the results JSON. Defaults to <output_dir>/results/inference_results.json.",
     )
     parser.add_argument(
         "--trust_remote_code",
@@ -356,6 +407,7 @@ def discover_videos(video_dir: Path, task_mode: str, logger: logging.Logger) -> 
     return selected, skipped
 
 
+@lru_cache(maxsize=None)
 def ffprobe_json(video_path: Path) -> Dict[str, Any]:
     cmd = [
         "ffprobe",
@@ -432,6 +484,9 @@ def split_video_into_chunks(
         cmd = [
             "ffmpeg",
             "-y",
+            "-nostdin",
+            "-v",
+            "error",
             "-ss",
             f"{start_sec:.3f}",
             "-i",
@@ -993,19 +1048,22 @@ def render_annotated_chunk(
     output_chunk: Path,
     chunk_result: Dict[str, Any],
     font_file: Path,
-    logger: logging.Logger,
+    logger: Optional[logging.Logger] = None,
+    frame_size: Optional[Tuple[int, int]] = None,
 ) -> None:
-    width, height = ffprobe_size(input_chunk)
+    if frame_size is None:
+        width, height = ffprobe_size(input_chunk)
+    else:
+        width, height = frame_size
+
     lines, hazard_present_yes = build_overlay_lines(chunk_result)
     layout = compute_overlay_layout(width, height, len(lines))
 
     with tempfile.TemporaryDirectory(prefix="overlay_lines_") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
-        line_files: List[Path] = []
-        for line_index, line in enumerate(lines):
-            line_file = temp_dir / f"line_{line_index:02d}.txt"
-            line_file.write_text(line, encoding="utf-8")
-            line_files.append(line_file)
+        lines_file = temp_dir / "overlay_lines.txt"
+        lines_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        font_color = "red" if hazard_present_yes else "white"
 
         filters = [
             (
@@ -1016,23 +1074,19 @@ def render_annotated_chunk(
                 f"drawbox=x={layout['panel_x']}:y={layout['panel_y']}:"
                 f"w={layout['panel_w']}:h={layout['panel_h']}:color=white@0.30:t=2"
             ),
-        ]
-
-        for line_index, line_file in enumerate(line_files):
-            line_y = layout["text_y"] + line_index * layout["line_h"]
-            font_color = "red" if hazard_present_yes else "white"
-            filters.append(
+            (
                 "drawtext="
                 f"fontfile='{escape_ffmpeg_path(font_file)}':"
-                f"textfile='{escape_ffmpeg_path(line_file)}':"
+                f"textfile='{escape_ffmpeg_path(lines_file)}':"
                 "reload=0:"
-                f"x={layout['text_x']}:y={line_y}:"
+                f"x={layout['text_x']}:y={layout['text_y']}:"
                 f"fontsize={layout['fontsize']}:"
                 f"fontcolor={font_color}:"
                 f"line_spacing={layout['line_spacing']}:"
                 "box=0:"
                 "fix_bounds=true"
-            )
+            ),
+        ]
 
         filter_complex = ",".join(filters)
         output_chunk.parent.mkdir(parents=True, exist_ok=True)
@@ -1040,6 +1094,9 @@ def render_annotated_chunk(
         cmd = [
             "ffmpeg",
             "-y",
+            "-nostdin",
+            "-v",
+            "error",
             "-i",
             str(input_chunk),
             "-vf",
@@ -1050,6 +1107,8 @@ def render_annotated_chunk(
             "0:a?",
             "-c:v",
             "libx264",
+            "-threads",
+            "1",
             "-preset",
             "medium",
             "-crf",
@@ -1086,6 +1145,9 @@ def concatenate_chunks(
         copy_cmd = [
             "ffmpeg",
             "-y",
+            "-nostdin",
+            "-v",
+            "error",
             "-f",
             "concat",
             "-safe",
@@ -1104,6 +1166,9 @@ def concatenate_chunks(
         reencode_cmd = [
             "ffmpeg",
             "-y",
+            "-nostdin",
+            "-v",
+            "error",
             "-f",
             "concat",
             "-safe",
@@ -1206,73 +1271,154 @@ def build_run_metadata(
     }
 
 
-def main() -> None:
-    args = parse_args()
+def build_empty_results(
+    *,
+    args: argparse.Namespace,
+    video_dir: Path,
+    robot_prompt_path: Path,
+    fork_prompt_path: Path,
+    skipped_files: List[Dict[str, Any]],
+    model_info: Optional[Dict[str, Any]] = None,
+    prompts: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    if model_info is None:
+        model_info = {}
+    if prompts is None:
+        prompts = {"robot": "", "forklift": ""}
 
-    if IMPORT_ERROR is not None:
-        raise ImportError(
-            "Missing runtime dependencies. Install torch, transformers, peft, and numpy before running this script."
-        ) from IMPORT_ERROR
-
-    output_paths = create_output_layout(Path(args.output_dir).resolve())
-    logger = setup_logging(output_paths["logs_dir"] / "run.log")
-
-    ensure_binary("ffmpeg")
-    ensure_binary("ffprobe")
-
-    project_root = Path.cwd().resolve()
-    video_dir = Path(args.video_dir).resolve()
-    robot_prompt_path = Path(args.robot_prompt_file).resolve()
-    fork_prompt_path = Path(args.fork_prompt_file).resolve()
-
-    if not video_dir.exists():
-        raise FileNotFoundError(f"Video directory not found: {video_dir}")
-    if not robot_prompt_path.exists():
-        raise FileNotFoundError(f"Robot prompt file not found: {robot_prompt_path}")
-    if not fork_prompt_path.exists():
-        raise FileNotFoundError(f"Forklift prompt file not found: {fork_prompt_path}")
-
-    prompts = {
-        "robot": load_text(robot_prompt_path),
-        "forklift": load_text(fork_prompt_path),
-    }
-    prompt_files = {
-        "robot": robot_prompt_path,
-        "forklift": fork_prompt_path,
-    }
-
-    selected_videos, skipped_files = discover_videos(video_dir, args.task_mode, logger)
-    save_json(output_paths["logs_dir"] / "skipped_files.json", skipped_files)
-
-    if not selected_videos:
-        logger.warning("No matching videos found. Exiting after writing skipped file log.")
-        empty_results = {
-            "run": {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "base_model": args.base_model,
-                "adapter_dir": str(Path(args.adapter_dir).resolve()),
-                "video_dir": str(video_dir),
-                "task_mode": args.task_mode,
-                "prompt_files": {
-                    "robot": str(robot_prompt_path),
-                    "forklift": str(fork_prompt_path),
-                },
+    return {
+        "run": {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "base_model": args.base_model,
+            "adapter_dir": str(Path(args.adapter_dir).resolve()),
+            "video_dir": str(video_dir.resolve()),
+            "task_mode": args.task_mode,
+            "prompt_files": {
+                "robot": str(robot_prompt_path.resolve()),
+                "forklift": str(fork_prompt_path.resolve()),
             },
-            "videos": [],
-            "skipped_files": skipped_files,
-            "failed_chunks": [],
+            "prompt_lengths": {task: len(text) for task, text in prompts.items()},
+            "chunk_sec": args.chunk_sec,
+            "generation": {
+                "num_frames": args.num_frames,
+                "max_new_tokens": args.max_new_tokens,
+                "temperature": args.temperature,
+                "do_sample": args.do_sample,
+            },
+            "model_info": model_info,
+        },
+        "videos": [],
+        "skipped_files": skipped_files,
+        "failed_chunks": [],
+    }
+
+
+def build_video_record(video_path: Path, task: str) -> Dict[str, Any]:
+    return {
+        "source_path": str(video_path.resolve()),
+        "video_name": video_path.name,
+        "video_stem": video_path.stem,
+        "task": task,
+        "total_duration": None,
+        "total_chunks": 0,
+        "annotated_video_path": None,
+        "chunks": [],
+    }
+
+
+def build_chunk_result(
+    *,
+    video_path: Path,
+    task: str,
+    prompt_path: Path,
+    chunk_meta: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "source_video": str(video_path.resolve()),
+        "video_name": video_path.name,
+        "task": task,
+        "chunk_index": chunk_meta["chunk_index"],
+        "chunk_path": str(Path(chunk_meta["chunk_path"]).resolve()),
+        "start_time": chunk_meta["start_time"],
+        "end_time": chunk_meta["end_time"],
+        "duration": chunk_meta["duration"],
+        "prompt_file_used": str(prompt_path.resolve()),
+        "raw_response_text": None,
+        "parsed_response": None,
+        "parse_success": False,
+        "parse_error": None,
+        "required_fields": TASK_REQUIRED_FIELDS[task],
+        "missing_required_fields": list(TASK_REQUIRED_FIELDS[task]),
+        "extra_fields": [],
+        "required_fields_present": False,
+        "template_mode": None,
+        "video_backend": None,
+        "error_message": None,
+        "annotated_chunk_path": None,
+    }
+
+
+def append_failed_chunk(
+    failed_chunks: List[Dict[str, Any]],
+    *,
+    chunk_result: Dict[str, Any],
+    error_message: str,
+) -> None:
+    failed_chunks.append({
+        "source_video": chunk_result["source_video"],
+        "task": chunk_result["task"],
+        "chunk_index": chunk_result["chunk_index"],
+        "chunk_path": chunk_result["chunk_path"],
+        "start_time": chunk_result["start_time"],
+        "end_time": chunk_result["end_time"],
+        "duration": chunk_result["duration"],
+        "error_message": error_message,
+    })
+
+
+def load_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_progress(results: Dict[str, Any], results_json_path: Path, failed_chunks_path: Path) -> None:
+    save_json(results_json_path, results)
+    save_json(failed_chunks_path, results.get("failed_chunks", []))
+
+
+def render_annotated_chunk_worker(job: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        render_annotated_chunk(
+            input_chunk=Path(job["input_chunk"]),
+            output_chunk=Path(job["output_chunk"]),
+            chunk_result=job["chunk_result"],
+            font_file=Path(job["font_file"]),
+            frame_size=(job["width"], job["height"]),
+        )
+        return {
+            "success": True,
+            "annotated_chunk_path": str(Path(job["output_chunk"]).resolve()),
         }
-        save_json(output_paths["results_dir"] / "inference_results.json", empty_results)
-        return
+    except Exception as exc:
+        return {
+            "success": False,
+            "error_message": str(exc),
+        }
 
-    chunk_root = output_paths["chunks_dir"] if args.save_chunks else (output_paths["temp_dir"] / "chunks")
-    overlay_chunk_root = output_paths["overlay_chunks_dir"] if args.save_overlay else (output_paths["temp_dir"] / "overlay_chunks")
-    chunk_root.mkdir(parents=True, exist_ok=True)
-    overlay_chunk_root.mkdir(parents=True, exist_ok=True)
 
-    font_file = detect_font_file(args.font_file)
-    logger.info("Using font file: %s", font_file)
-
+def run_inference_phase(
+    *,
+    args: argparse.Namespace,
+    selected_videos: List[Dict[str, Any]],
+    prompts: Dict[str, str],
+    prompt_files: Dict[str, Path],
+    project_root: Path,
+    chunk_root: Path,
+    results: Dict[str, Any],
+    results_json_path: Path,
+    failed_chunks_path: Path,
+    logger: logging.Logger,
+) -> Dict[str, Any]:
+    ensure_ml_dependencies()
     model, processor, model_info = load_model_and_processor(
         base_model=args.base_model,
         adapter_dir=args.adapter_dir,
@@ -1280,28 +1426,15 @@ def main() -> None:
         trust_remote_code=args.trust_remote_code,
         logger=logger,
     )
-
-    results: Dict[str, Any] = {
-        "run": build_run_metadata(args, prompts, model_info),
-        "videos": [],
-        "skipped_files": skipped_files,
-        "failed_chunks": [],
-    }
+    results["run"] = build_run_metadata(args, prompts, model_info)
+    results["videos"] = []
+    results.setdefault("failed_chunks", [])
 
     for video_info in selected_videos:
         video_path = Path(video_info["path"])
-        logger.info("Processing video: %s", video_path.name)
+        logger.info("Phase A | Processing video: %s", video_path.name)
 
-        video_record: Dict[str, Any] = {
-            "source_path": str(video_path.resolve()),
-            "video_name": video_path.name,
-            "video_stem": video_path.stem,
-            "task": video_info["task"],
-            "total_duration": None,
-            "total_chunks": 0,
-            "annotated_video_path": None,
-            "chunks": [],
-        }
+        video_record = build_video_record(video_path=video_path, task=video_info["task"])
 
         try:
             chunk_records, total_duration = split_video_into_chunks(
@@ -1327,38 +1460,20 @@ def main() -> None:
             results["failed_chunks"].append(failure)
             video_record["error"] = failure["error_message"]
             results["videos"].append(video_record)
+            save_progress(results, results_json_path, failed_chunks_path)
             continue
 
-        annotated_chunk_paths: List[Path] = []
         for chunk_meta in chunk_records:
             chunk_path = Path(chunk_meta["chunk_path"])
             task = video_info["task"]
             prompt_text = prompts[task]
             prompt_path = prompt_files[task]
-
-            chunk_result: Dict[str, Any] = {
-                "source_video": str(video_path.resolve()),
-                "video_name": video_path.name,
-                "task": task,
-                "chunk_index": chunk_meta["chunk_index"],
-                "chunk_path": str(chunk_path.resolve()),
-                "start_time": chunk_meta["start_time"],
-                "end_time": chunk_meta["end_time"],
-                "duration": chunk_meta["duration"],
-                "prompt_file_used": str(prompt_path.resolve()),
-                "raw_response_text": None,
-                "parsed_response": None,
-                "parse_success": False,
-                "parse_error": None,
-                "required_fields": TASK_REQUIRED_FIELDS[task],
-                "missing_required_fields": TASK_REQUIRED_FIELDS[task],
-                "extra_fields": [],
-                "required_fields_present": False,
-                "template_mode": None,
-                "video_backend": None,
-                "error_message": None,
-                "annotated_chunk_path": None,
-            }
+            chunk_result = build_chunk_result(
+                video_path=video_path,
+                task=task,
+                prompt_path=prompt_path,
+                chunk_meta=chunk_meta,
+            )
 
             try:
                 messages = build_user_messages(chunk_path=chunk_path, prompt_text=prompt_text, project_root=project_root)
@@ -1379,77 +1494,241 @@ def main() -> None:
             except Exception as exc:
                 logger.exception("Inference failed for chunk %s", chunk_path.name)
                 chunk_result["error_message"] = str(exc)
-                results["failed_chunks"].append({
-                    "source_video": chunk_result["source_video"],
-                    "task": task,
-                    "chunk_index": chunk_result["chunk_index"],
-                    "chunk_path": chunk_result["chunk_path"],
-                    "start_time": chunk_result["start_time"],
-                    "end_time": chunk_result["end_time"],
-                    "duration": chunk_result["duration"],
-                    "error_message": str(exc),
-                })
-
-            try:
-                annotated_chunk_path = overlay_chunk_root / video_path.stem / chunk_path.name
-                render_annotated_chunk(
-                    input_chunk=chunk_path,
-                    output_chunk=annotated_chunk_path,
-                    chunk_result=chunk_result,
-                    font_file=font_file,
-                    logger=logger,
-                )
-                chunk_result["annotated_chunk_path"] = str(annotated_chunk_path.resolve())
-                annotated_chunk_paths.append(annotated_chunk_path.resolve())
-            except Exception as exc:
-                logger.exception("Overlay rendering failed for chunk %s", chunk_path.name)
-                chunk_result["error_message"] = (
-                    f"{chunk_result['error_message']} | overlay_failed: {exc}"
-                    if chunk_result["error_message"]
-                    else f"overlay_failed: {exc}"
-                )
-                results["failed_chunks"].append({
-                    "source_video": chunk_result["source_video"],
-                    "task": task,
-                    "chunk_index": chunk_result["chunk_index"],
-                    "chunk_path": chunk_result["chunk_path"],
-                    "start_time": chunk_result["start_time"],
-                    "end_time": chunk_result["end_time"],
-                    "duration": chunk_result["duration"],
-                    "error_message": f"overlay_failed: {exc}",
-                })
+                append_failed_chunk(results["failed_chunks"], chunk_result=chunk_result, error_message=str(exc))
 
             video_record["chunks"].append(chunk_result)
 
+        results["videos"].append(video_record)
+        save_progress(results, results_json_path, failed_chunks_path)
+
+    return results
+
+
+def render_video_overlays(
+    *,
+    args: argparse.Namespace,
+    results: Dict[str, Any],
+    overlay_chunk_root: Path,
+    font_file: Path,
+    results_json_path: Path,
+    failed_chunks_path: Path,
+    logger: logging.Logger,
+) -> None:
+    results.setdefault("failed_chunks", [])
+
+    for video_record in results.get("videos", []):
+        source_path = Path(video_record["source_path"])
+        logger.info("Phase B | Rendering overlays for %s", source_path.name)
+        video_record["annotated_video_path"] = None
+
+        try:
+            frame_size = ffprobe_size(source_path)
+        except Exception as exc:
+            logger.exception("Failed to probe video size for %s", source_path.name)
+            video_record["error"] = f"overlay_probe_failed: {exc}"
+            save_progress(results, results_json_path, failed_chunks_path)
+            continue
+
+        jobs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        for chunk_result in sorted(video_record.get("chunks", []), key=lambda item: item.get("chunk_index", 0)):
+            chunk_result["annotated_chunk_path"] = None
+            input_chunk = Path(chunk_result["chunk_path"])
+            if not input_chunk.exists():
+                error_message = f"overlay_input_missing: {input_chunk}"
+                logger.error("Missing chunk for overlay: %s", input_chunk)
+                chunk_result["error_message"] = (
+                    f"{chunk_result['error_message']} | {error_message}"
+                    if chunk_result.get("error_message")
+                    else error_message
+                )
+                append_failed_chunk(results["failed_chunks"], chunk_result=chunk_result, error_message=error_message)
+                continue
+
+            output_chunk = overlay_chunk_root / video_record["video_stem"] / input_chunk.name
+            jobs.append((
+                {
+                    "input_chunk": str(input_chunk.resolve()),
+                    "output_chunk": str(output_chunk.resolve()),
+                    "chunk_result": {
+                        "task": chunk_result["task"],
+                        "start_time": chunk_result["start_time"],
+                        "end_time": chunk_result["end_time"],
+                        "parsed_response": chunk_result.get("parsed_response"),
+                    },
+                    "font_file": str(font_file.resolve()),
+                    "width": frame_size[0],
+                    "height": frame_size[1],
+                },
+                chunk_result,
+            ))
+
+        if args.overlay_workers == 1 or len(jobs) <= 1:
+            worker_results = [(job, chunk_result, render_annotated_chunk_worker(job)) for job, chunk_result in jobs]
+        else:
+            worker_results = []
+            with concurrent.futures.ProcessPoolExecutor(max_workers=args.overlay_workers) as executor:
+                future_map = {
+                    executor.submit(render_annotated_chunk_worker, job): (job, chunk_result)
+                    for job, chunk_result in jobs
+                }
+                for future in concurrent.futures.as_completed(future_map):
+                    job, chunk_result = future_map[future]
+                    try:
+                        worker_result = future.result()
+                    except Exception as exc:
+                        worker_result = {
+                            "success": False,
+                            "error_message": f"overlay_worker_crashed: {exc}",
+                        }
+                    worker_results.append((job, chunk_result, worker_result))
+
+        for _, chunk_result, worker_result in worker_results:
+            if worker_result["success"]:
+                chunk_result["annotated_chunk_path"] = worker_result["annotated_chunk_path"]
+                continue
+
+            overlay_error = f"overlay_failed: {worker_result['error_message']}"
+            logger.error("Overlay rendering failed for chunk %s: %s", chunk_result["chunk_path"], worker_result["error_message"])
+            chunk_result["error_message"] = (
+                f"{chunk_result['error_message']} | {overlay_error}"
+                if chunk_result.get("error_message")
+                else overlay_error
+            )
+            append_failed_chunk(results["failed_chunks"], chunk_result=chunk_result, error_message=overlay_error)
+
+        annotated_chunk_paths = [
+            Path(chunk_result["annotated_chunk_path"]).resolve()
+            for chunk_result in sorted(video_record.get("chunks", []), key=lambda item: item.get("chunk_index", 0))
+            if chunk_result.get("annotated_chunk_path")
+        ]
+
         if annotated_chunk_paths:
-            final_video_path = output_paths["overlays_dir"] / f"{video_path.stem}_annotated.mp4"
+            final_video_path = overlay_chunk_root.parent / f"{video_record['video_stem']}_annotated.mp4"
             try:
                 concatenate_chunks(
                     annotated_chunk_paths,
                     final_video_path,
                     logger,
-                    expected_size=ffprobe_size(video_path),
+                    expected_size=frame_size,
                 )
                 video_record["annotated_video_path"] = str(final_video_path.resolve())
+                if video_record.get("error") == "no_annotated_chunks_created":
+                    video_record.pop("error", None)
             except Exception as exc:
-                logger.exception("Final concatenation failed for %s", video_path.name)
+                logger.exception("Final concatenation failed for %s", source_path.name)
                 video_record["error"] = f"concat_failed: {exc}"
         else:
             video_record["error"] = "no_annotated_chunks_created"
 
-        results["videos"].append(video_record)
-        save_json(output_paths["results_dir"] / "inference_results.json", results)
-        save_json(output_paths["logs_dir"] / "failed_chunks.json", results["failed_chunks"])
+        save_progress(results, results_json_path, failed_chunks_path)
 
-    save_json(output_paths["results_dir"] / "inference_results.json", results)
-    save_json(output_paths["logs_dir"] / "failed_chunks.json", results["failed_chunks"])
+
+def run_pipeline(args: argparse.Namespace) -> None:
+    if args.overlay_workers < 1:
+        raise ValueError("--overlay_workers must be at least 1.")
+
+    output_paths = create_output_layout(Path(args.output_dir).resolve())
+    logger = setup_logging(output_paths["logs_dir"] / "run.log")
+    initialize_environment(logger)
+
+    project_root = Path.cwd().resolve()
+    video_dir = Path(args.video_dir).resolve()
+    robot_prompt_path = Path(args.robot_prompt_file).resolve()
+    fork_prompt_path = Path(args.fork_prompt_file).resolve()
+    results_json_path = Path(args.results_json).resolve() if args.results_json else (output_paths["results_dir"] / "inference_results.json")
+    failed_chunks_path = output_paths["logs_dir"] / "failed_chunks.json"
+    chunk_root = output_paths["chunks_dir"] if args.save_chunks else (output_paths["temp_dir"] / "chunks")
+    overlay_chunk_root = output_paths["overlay_chunks_dir"] if args.save_overlay else (output_paths["temp_dir"] / "overlay_chunks")
+    chunk_root.mkdir(parents=True, exist_ok=True)
+    overlay_chunk_root.mkdir(parents=True, exist_ok=True)
+
+    should_chunk_or_overlay = not (args.skip_inference and args.skip_overlay)
+    if should_chunk_or_overlay:
+        ensure_binary("ffmpeg")
+        ensure_binary("ffprobe")
+
+    if not args.skip_inference:
+        if not video_dir.exists():
+            raise FileNotFoundError(f"Video directory not found: {video_dir}")
+        if not robot_prompt_path.exists():
+            raise FileNotFoundError(f"Robot prompt file not found: {robot_prompt_path}")
+        if not fork_prompt_path.exists():
+            raise FileNotFoundError(f"Forklift prompt file not found: {fork_prompt_path}")
+
+        prompts = {
+            "robot": load_text(robot_prompt_path),
+            "forklift": load_text(fork_prompt_path),
+        }
+        prompt_files = {
+            "robot": robot_prompt_path,
+            "forklift": fork_prompt_path,
+        }
+
+        selected_videos, skipped_files = discover_videos(video_dir, args.task_mode, logger)
+        save_json(output_paths["logs_dir"] / "skipped_files.json", skipped_files)
+
+        results = build_empty_results(
+            args=args,
+            video_dir=video_dir,
+            robot_prompt_path=robot_prompt_path,
+            fork_prompt_path=fork_prompt_path,
+            skipped_files=skipped_files,
+            prompts=prompts,
+        )
+
+        if not selected_videos:
+            logger.warning("No matching videos found. Exiting after writing skipped file log.")
+            save_progress(results, results_json_path, failed_chunks_path)
+            return
+
+        results = run_inference_phase(
+            args=args,
+            selected_videos=selected_videos,
+            prompts=prompts,
+            prompt_files=prompt_files,
+            project_root=project_root,
+            chunk_root=chunk_root,
+            results=results,
+            results_json_path=results_json_path,
+            failed_chunks_path=failed_chunks_path,
+            logger=logger,
+        )
+        logger.info("Phase A complete. Inference results written to %s", results_json_path)
+    else:
+        if not results_json_path.exists():
+            raise FileNotFoundError(
+                f"--skip_inference was set, but results JSON was not found: {results_json_path}"
+            )
+        results = load_json(results_json_path)
+        save_json(output_paths["logs_dir"] / "skipped_files.json", results.get("skipped_files", []))
+        logger.info("Loaded existing results from %s", results_json_path)
+
+    if not args.skip_overlay:
+        font_file = detect_font_file(args.font_file)
+        logger.info("Using font file: %s", font_file)
+        render_video_overlays(
+            args=args,
+            results=results,
+            overlay_chunk_root=overlay_chunk_root,
+            font_file=font_file,
+            results_json_path=results_json_path,
+            failed_chunks_path=failed_chunks_path,
+            logger=logger,
+        )
+        logger.info("Phase B complete. Overlay outputs written under %s", output_paths["overlays_dir"])
+    else:
+        save_progress(results, results_json_path, failed_chunks_path)
 
     if not args.save_chunks:
         cleanup_dir_if_allowed(chunk_root, output_paths["root"], logger)
     if not args.save_overlay:
         cleanup_dir_if_allowed(overlay_chunk_root, output_paths["root"], logger)
 
-    logger.info("Run complete. Results written to %s", output_paths["results_dir"] / "inference_results.json")
+    logger.info("Run complete. Results written to %s", results_json_path)
+
+
+def main() -> None:
+    run_pipeline(parse_args())
 
 
 if __name__ == "__main__":
