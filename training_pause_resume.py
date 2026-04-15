@@ -1,3 +1,88 @@
+'''
+This training setup supports **safe pause and resume** for long fine-tuning runs.
+
+## Flags
+
+`--pause_file <path>`
+Lets you pause training by creating a file while training is running.
+
+`--pause_on_interrupt`
+Lets `Ctrl+C` request a safe pause instead of stopping abruptly.
+
+`--resume_from_checkpoint last`
+Resumes from the latest **complete** checkpoint inside `output_dir`.
+
+## What happens when pausing
+
+When a pause is requested, training will:
+
+1. finish the current safe optimizer-step boundary
+2. save a full Trainer checkpoint
+3. write `pause_resume_state.json`
+4. exit cleanly
+
+## Start training
+
+### Linux / Bash
+
+```bash
+python train_qwen35_video_lora.py \
+  --train_file vlm_dataset_both_aug/train_chat.jsonl \
+  --val_file vlm_dataset_both_aug/val_chat.jsonl \
+  --test_file vlm_dataset_both_aug/test_chat.jsonl \
+  --output_dir runs/qwen35_9b_both_aug \
+  --pause_file runs/qwen35_9b_both_aug/pause.request \
+  --pause_on_interrupt \
+  --gradient_checkpointing \
+  --use_fp16
+```
+
+## Pause training
+
+### Linux / Bash
+
+```bash
+touch runs/qwen35_9b_both_aug/pause.request
+```
+
+Or press `Ctrl+C` once if `--pause_on_interrupt` was enabled.
+
+## Resume training
+
+Resume with the same command and add:
+
+```bash
+--resume_from_checkpoint last
+```
+
+### Linux / Bash
+
+```bash
+rm -f runs/qwen35_9b_both_aug/pause.request
+
+python train_qwen35_video_lora.py \
+  --train_file vlm_dataset_both_aug/train_chat.jsonl \
+  --val_file vlm_dataset_both_aug/val_chat.jsonl \
+  --test_file vlm_dataset_both_aug/test_chat.jsonl \
+  --output_dir runs/qwen35_9b_both_aug \
+  --pause_file runs/qwen35_9b_both_aug/pause.request \
+  --pause_on_interrupt \
+  --resume_from_checkpoint last \
+  --gradient_checkpointing \
+  --use_fp16
+```
+
+## Important notes
+* Keep the same `output_dir` when resuming.
+* Keep the same model and training settings.
+* Remove the pause file before resuming, otherwise training may pause again immediately.
+* `last` resumes only from a complete checkpoint and ignores incomplete ones.
+
+## Typical workflow
+Start training at night, pause during the day using the pause file or `Ctrl+C`, then resume later with `--resume_from_checkpoint last`.
+'''
+
+
 from __future__ import annotations
 
 import contextlib
@@ -9,7 +94,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
-
 
 CHECKPOINT_DIR_RE = re.compile(r"^checkpoint-(\d+)$")
 DEFAULT_STATE_FILENAME = "pause_resume_state.json"

@@ -28,7 +28,6 @@ python infer_lora_video_overlay.py \
   --device cuda:0 \
   --save_chunks \
   --save_overlay
-
 """
 
 from __future__ import annotations
@@ -41,7 +40,7 @@ import math
 import os
 import shutil
 import subprocess
-import dotenv
+from dotenv import load_dotenv
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path

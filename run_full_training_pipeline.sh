@@ -82,8 +82,8 @@ conda activate hazard_finetune_v100
 log "Training Qwen 3.5 LoRA with explicit target modules"
 run_cmd python train_qwen35_video_lora.py \
   --train_file vlm_dataset_both_aug/train_chat.jsonl \
-  --val_file vlm_dataset_both_aug/val_chat.jsonl \
-  --test_file vlm_dataset_both_aug/test_chat.jsonl \
+  --val_file   vlm_dataset_both_aug/val_chat.jsonl \
+  --test_file  vlm_dataset_both_aug/test_chat.jsonl \
   --model_name_or_path Qwen/Qwen3.5-9B \
   --output_dir runs/qwen35_9b_both_aug_2 \
   --num_frames 12 \
@@ -103,44 +103,48 @@ run_cmd python train_qwen35_video_lora.py \
   --save_strategy epoch \
   --save_total_limit 9 \
   --attn_implementation sdpa \
-  --seed 3407
+  --seed 3407 \
+  --pause_on_interrupt \
+  --resume_from_checkpoint last
 
 garbage_clean
 
 log "Training Qwen 3.5 LoRA with all-linear target modules"
 run_cmd python train_qwen35_video_lora.py \
   --train_file vlm_dataset_both_aug/train_chat.jsonl \
-  --val_file vlm_dataset_both_aug/val_chat.jsonl \
-  --test_file vlm_dataset_both_aug/test_chat.jsonl \
+  --val_file   vlm_dataset_both_aug/val_chat.jsonl \
+  --test_file  vlm_dataset_both_aug/test_chat.jsonl \
   --model_name_or_path Qwen/Qwen3.5-9B \
   --output_dir runs/qwen35_9b_both_aug_all \
   --num_frames 12 \
-  --per_device_train_batch_size 1 \
-  --gradient_accumulation_steps 8 \
-  --num_train_epochs 20 \
+  --per_device_train_batch_size 4 \
+  --gradient_accumulation_steps 16 \
+  --num_train_epochs 9 \
   --learning_rate 1e-4 \
   --warmup_ratio 0.10 \
   --weight_decay 0.01 \
-  --lora_r 16 \
-  --lora_alpha 32 \
+  --lora_r 32 \
+  --lora_alpha 64 \
   --lora_dropout 0.05 \
   --lora_target_modules all-linear \
   --gradient_checkpointing \
   --use_fp16 \
   --eval_strategy epoch \
   --save_strategy epoch \
-  --save_total_limit 20 \
-  --attn_implementation eager \
-  --seed 3407
+  --save_total_limit 9 \
+  --attn_implementation sdpa \
+  --seed 3407 \
+  --pause_on_interrupt \
+  --resume_from_checkpoint last
 
 garbage_clean
 
 log "Evaluating Qwen checkpoints: runs/qwen35_9b_both_aug"
 run_cmd python eval_lora_checkpoints.py \
-  --adapter_dir runs/qwen35_9b_both_aug \
+  --adapter_dir runs/qwen35_9b_both_aug_2\
   --test_file vlm_dataset_both_aug/test_chat.jsonl \
   --project_root . \
-  --task_mode robot \
+  --task_mode both \
   --use_fp16
 
 log "Evaluating Qwen checkpoints: runs/qwen35_9b_both_aug_all"
@@ -148,7 +152,7 @@ run_cmd python eval_lora_checkpoints.py \
   --adapter_dir runs/qwen35_9b_both_aug_all \
   --test_file vlm_dataset_both_aug/test_chat.jsonl \
   --project_root . \
-  --task_mode robot \
+  --task_mode both \
   --use_fp16
 
 garbage_clean
@@ -171,11 +175,11 @@ run_cmd python train_gemma4.py \
   --model_name_or_path google/gemma-4-E4B-it \
   --output_dir runs/gemma4_e4b_video_lora \
   --video_load_backend torchvision \
-  --num_frames 8 \
+  --num_frames 12 \
   --fps 1 \
   --per_device_train_batch_size 1 \
-  --per_device_eval_batch_size 1 \
-  --gradient_accumulation_steps 8 \
+  --per_device_eval_batch_size 4 \
+  --gradient_accumulation_steps 16 \
   --num_train_epochs 20 \
   --save_total_limit 20 \
   --learning_rate 1e-4 \
