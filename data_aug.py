@@ -16,12 +16,12 @@ import numpy as np
 # 1. CONFIGURATION
 # ==========================================
 ORIGINAL_JSONL_PATHS = [
-    "vlm_dataset_both/train_chat.jsonl",
-    "vlm_dataset_both/val_chat.jsonl",
-    "vlm_dataset_both/test_chat.jsonl",
+    "vlm_dataset_robot/train_chat.jsonl",
+    "vlm_dataset_robot/val_chat.jsonl",
+    "vlm_dataset_robot/test_chat.jsonl",
 ]
 
-OUTPUT_DIR = "vlm_dataset_both_aug"
+OUTPUT_DIR = "vlm_dataset_robot_aug"
 OUTPUT_VIDEOS_DIR = os.path.join(OUTPUT_DIR, "clips")
 TEMP_DIR = os.path.join(OUTPUT_DIR, "_temp")
 os.makedirs(OUTPUT_VIDEOS_DIR, exist_ok=True)
