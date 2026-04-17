@@ -19,7 +19,7 @@ Key updates:
 
 Example: (MIXED)
 python eval_lora_checkpoints.py \
-  --adapter_dir runs/qwen35_9b_both_aug \
+  --adapter_dir runs/qwen35_9b_both_aug_2 \
   --test_file vlm_dataset_both_aug/test_chat.jsonl \
   --project_root . \
   --task_mode both \

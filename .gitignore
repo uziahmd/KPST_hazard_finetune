@@ -34,3 +34,4 @@ vlm_dataset_*/
 runs/
 .tmp_*/
 test/
+logs/
