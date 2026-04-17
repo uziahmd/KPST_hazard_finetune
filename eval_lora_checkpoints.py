@@ -498,15 +498,12 @@ def infer_task_from_text(text: str) -> Optional[str]:
     return None
 
 
-def infer_task(
+def detect_task_from_example(
     example: Dict[str, Any],
-    prompt_messages: List[Dict[str, Any]],
-    gt_parsed: Dict[str, Any],
-    task_mode: str,
-) -> str:
-    if task_mode in {"forklift", "robot"}:
-        return task_mode
-
+    *,
+    project_root: Optional[str] = None,
+    test_file_dir: Optional[str] = None,
+) -> Tuple[str, str]:
     meta = example.get("meta", {}) or {}
 
     # 1) explicit task metadata
@@ -518,45 +515,87 @@ def infer_task(
     ]:
         task = canonicalize_task_name(candidate)
         if task is not None:
-            return task
+            return task, "metadata"
 
     # 2) sample_id conventions
     sample_id = str(example.get("sample_id", "")).lower()
     if sample_id.startswith("fork_") or sample_id.startswith("forklift_") or "_fork_" in sample_id:
-        return "forklift"
+        return "forklift", "sample_id"
     if sample_id.startswith("robot_") or "_robot_" in sample_id:
-        return "robot"
+        return "robot", "sample_id"
 
     # 3) label signature conventions
     label_signature = str(meta.get("label_signature", "")).lower()
     if label_signature.startswith("forklift|") or label_signature.startswith("fork|"):
-        return "forklift"
+        return "forklift", "label_signature"
     if label_signature.startswith("robot|"):
-        return "robot"
+        return "robot", "label_signature"
 
-    # 4) ground truth keys
-    if "object_direction" in gt_parsed:
-        return "forklift"
-    robot_core = {"hazard_label", "hazard_present", "zone_relation", "object_state"}
-    if robot_core.issubset(set(gt_parsed.keys())):
-        return "robot"
+    root_for_detection = project_root or "."
+    file_dir_for_detection = test_file_dir or "."
 
-    # 5) prompt text
-    joined_prompt = "\n".join(
-        extract_text_from_message(m) for m in prompt_messages if m.get("role") != "assistant"
-    )
-    task = infer_task_from_text(joined_prompt)
-    if task is not None:
-        return task
+    try:
+        normalized_messages = normalize_messages(
+            example,
+            project_root=root_for_detection,
+            test_file_dir=file_dir_for_detection,
+        )
+        prompt_messages, target_message = split_prompt_and_target(normalized_messages)
+        gt_text = extract_text_from_message(target_message)
+        gt_parsed = canonicalize_prediction_dict(try_parse_json(gt_text)) or {}
+
+        # 4) ground truth keys
+        if "object_direction" in gt_parsed:
+            return "forklift", "ground_truth_keys"
+        robot_core = {"hazard_label", "hazard_present", "zone_relation", "object_state"}
+        if robot_core.issubset(set(gt_parsed.keys())):
+            return "robot", "ground_truth_keys"
+
+        # 5) prompt text
+        joined_prompt = "\n".join(
+            extract_text_from_message(m) for m in prompt_messages if m.get("role") != "assistant"
+        )
+        task = infer_task_from_text(joined_prompt)
+        if task is not None:
+            return task, "prompt_text"
+    except Exception:
+        pass
 
     # Final fallback:
-    # If mixed mode and still unknown, default based on presence/absence of object_direction.
-    # If it isn't there, robot is safer.
-    return "robot"
+    return "robot", "fallback"
 
 
 def get_fields_for_task(task: str) -> List[str]:
     return TASK_FIELDS.get(task, TASK_FIELDS["robot"])
+
+
+def annotate_and_filter_test_data(
+    test_data: List[Dict[str, Any]],
+    *,
+    task_mode: str,
+    project_root: str,
+    test_file_dir: str,
+) -> Tuple[List[Dict[str, Any]], Counter]:
+    detected_counts: Counter = Counter()
+    annotated_examples: List[Dict[str, Any]] = []
+
+    for example in test_data:
+        detected_task, detection_source = detect_task_from_example(
+            example,
+            project_root=project_root,
+            test_file_dir=test_file_dir,
+        )
+        annotated = dict(example)
+        annotated["_detected_task"] = detected_task
+        annotated["_task_detection_source"] = detection_source
+        annotated_examples.append(annotated)
+        detected_counts[detected_task] += 1
+
+    if task_mode == "both":
+        return annotated_examples, detected_counts
+
+    filtered = [example for example in annotated_examples if example["_detected_task"] == task_mode]
+    return filtered, detected_counts
 
 
 # -----------------------------------------------------------------------------
@@ -1152,8 +1191,14 @@ def evaluate_named_model(
         gt_text = ""
         gt_parsed: Dict[str, Any] = {}
         inference_time = 0.0
-        task = None
-        task_fields: List[str] = []
+        task = canonicalize_task_name(example.get("_detected_task"))
+        if task is None:
+            task, _ = detect_task_from_example(
+                example,
+                project_root=project_root,
+                test_file_dir=test_file_dir,
+            )
+        task_fields: List[str] = get_fields_for_task(task)
 
         try:
             normalized_messages = normalize_messages(
@@ -1167,14 +1212,6 @@ def evaluate_named_model(
             gt_parsed = canonicalize_prediction_dict(try_parse_json(gt_text)) or {}
             if not gt_parsed:
                 gt_parse_failed = True
-
-            task = infer_task(
-                example=example,
-                prompt_messages=prompt_messages,
-                gt_parsed=gt_parsed,
-                task_mode=args.task_mode,
-            )
-            task_fields = get_fields_for_task(task)
 
             t_inf_start = time.time()
             pred_text = run_inference_single(
@@ -1192,9 +1229,6 @@ def evaluate_named_model(
             pred_text = ""
             pred_parsed = None
             inference_time = 0.0
-            if task is None:
-                task = args.task_mode if args.task_mode != "both" else "robot"
-                task_fields = get_fields_for_task(task)
             print(f"\n[ERROR] {eval_name} :: {sample_id} :: {type(e).__name__}: {e}")
 
         field_matches = {}
@@ -1308,8 +1342,26 @@ def main() -> None:
 
     with open(args.test_file, "r", encoding="utf-8") as f:
         test_data = [json.loads(line) for line in f if line.strip()]
-    print(f"[INFO] Loaded {len(test_data)} test samples from {args.test_file}")
-    print(f"[INFO] Task mode: {args.task_mode}")
+    total_loaded = len(test_data)
+    test_file_dir = os.path.dirname(os.path.abspath(args.test_file))
+    project_root = os.path.abspath(args.project_root)
+    filtered_test_data, detected_counts = annotate_and_filter_test_data(
+        test_data,
+        task_mode=args.task_mode,
+        project_root=project_root,
+        test_file_dir=test_file_dir,
+    )
+
+    print(f"[INFO] Loaded test file: {args.test_file}")
+    print(f"[INFO] Total loaded samples: {total_loaded}")
+    print(f"[INFO] Selected task mode: {args.task_mode}")
+    print(f"[INFO] Detected robot samples: {detected_counts.get('robot', 0)}")
+    print(f"[INFO] Detected forklift samples: {detected_counts.get('forklift', 0)}")
+    print(f"[INFO] Retained samples after task_mode filter: {len(filtered_test_data)}")
+
+    if len(filtered_test_data) == 0:
+        print(f"[ERROR] No samples retained after applying --task_mode {args.task_mode} to {args.test_file}")
+        sys.exit(1)
 
     adapters = discover_adapters(args.adapter_dir, args.only_final, args.only_checkpoints)
     adapter_names = [name for name, _ in adapters]
@@ -1327,7 +1379,7 @@ def main() -> None:
             eval_name=args.base_eval_name,
             model=base_model,
             processor=processor,
-            test_data=test_data,
+            test_data=filtered_test_data,
             args=args,
             eval_dir=eval_dir,
         )
@@ -1341,7 +1393,7 @@ def main() -> None:
             eval_name=adapter_name,
             model=model,
             processor=processor,
-            test_data=test_data,
+            test_data=filtered_test_data,
             args=args,
             eval_dir=eval_dir,
         )
