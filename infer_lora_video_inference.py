@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import argparse
 
-from infer_lora_video_overlay import default_overlay_workers, run_pipeline
+from infer_lora_video_overlay import default_chunk_workers, default_overlay_workers, run_pipeline
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,6 +78,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional path for the results JSON. Defaults to <output_dir>/results/inference_results.json.",
     )
     parser.add_argument(
+        "--chunk_workers",
+        type=int,
+        default=default_chunk_workers(),
+        help="Number of parallel threads for ffmpeg video chunking (one thread per video).",
+    )
+    parser.add_argument(
         "--trust_remote_code",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -106,6 +112,7 @@ def main() -> None:
             save_chunks=args.save_chunks,
             save_overlay=False,
             font_file="",
+            chunk_workers=args.chunk_workers,
             overlay_workers=default_overlay_workers(),
             skip_inference=False,
             skip_overlay=True,

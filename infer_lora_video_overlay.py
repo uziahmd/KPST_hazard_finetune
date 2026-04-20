@@ -126,6 +126,10 @@ def default_overlay_workers() -> int:
     return max(1, min(4, os.cpu_count() or 1))
 
 
+def default_chunk_workers() -> int:
+    return max(1, min(4, os.cpu_count() or 1))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run LoRA video inference, JSON export, and overlay rendering on a folder of hazard videos."
@@ -186,6 +190,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Optional font file for ffmpeg drawtext. Auto-detected when omitted.",
+    )
+    parser.add_argument(
+        "--chunk_workers",
+        type=int,
+        default=default_chunk_workers(),
+        help="Number of parallel threads for ffmpeg video chunking (one thread per video).",
     )
     parser.add_argument(
         "--overlay_workers",
@@ -468,56 +478,44 @@ def split_video_into_chunks(
     video_chunk_dir = chunk_root / video_path.stem
     video_chunk_dir.mkdir(parents=True, exist_ok=True)
 
-    chunks: List[Dict[str, Any]] = []
-    total_chunks = int(math.ceil(duration / chunk_sec))
+    # Single ffmpeg pass: the segment muxer reads the file once and writes all
+    # clips, vs the old approach which spawned one process per clip.
+    # Outputs are written as seg_0000.mp4, seg_0001.mp4, … then renamed to the
+    # timestamp convention the rest of the pipeline expects.
+    # +faststart is intentionally omitted — these clips are only read locally
+    # for frame extraction so the moov-atom rewrite pass is wasted work.
+    seg_pattern = str(video_chunk_dir / "seg_%04d.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-nostdin", "-v", "error",
+        "-i", str(video_path),
+        "-map", "0:v:0", "-map", "0:a?",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        "-f", "segment",
+        "-segment_time", f"{chunk_sec:.3f}",
+        "-reset_timestamps", "1",
+        seg_pattern,
+    ]
+    result = run_cmd(cmd, logger=logger)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg segmentation failed for {video_path.name}: {result.stderr.strip()}")
 
-    for chunk_index in range(total_chunks):
+    tmp_segs = sorted(video_chunk_dir.glob("seg_*.mp4"), key=lambda p: p.name)
+    if not tmp_segs:
+        raise RuntimeError(f"ffmpeg segmentation produced no output files for {video_path.name}")
+
+    chunks: List[Dict[str, Any]] = []
+    for chunk_index, tmp_path in enumerate(tmp_segs):
         start_sec = chunk_index * chunk_sec
         end_sec = min(duration, start_sec + chunk_sec)
         part_duration = max(0.0, end_sec - start_sec)
         if part_duration <= 0:
+            tmp_path.unlink(missing_ok=True)
             continue
 
         chunk_name = f"{video_path.stem}__{format_time_token(start_sec)}_{format_time_token(end_sec)}.mp4"
         chunk_path = video_chunk_dir / chunk_name
-
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-nostdin",
-            "-v",
-            "error",
-            "-ss",
-            f"{start_sec:.3f}",
-            "-i",
-            str(video_path),
-            "-t",
-            f"{part_duration:.3f}",
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "20",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-movflags",
-            "+faststart",
-            str(chunk_path),
-        ]
-        result = run_cmd(cmd, logger=logger)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Failed to create chunk {chunk_path.name} from {video_path.name}: {result.stderr.strip()}"
-            )
+        tmp_path.rename(chunk_path)
 
         chunks.append({
             "original_video_path": str(video_path.resolve()),
@@ -1418,6 +1416,67 @@ def run_inference_phase(
     failed_chunks_path: Path,
     logger: logging.Logger,
 ) -> Dict[str, Any]:
+    results["videos"] = []
+    results.setdefault("failed_chunks", [])
+
+    # Pass 1: chunk every video before touching the GPU so ffmpeg and the model
+    # don't compete for CPU/memory and the GPU runs uninterrupted during inference.
+    # Multiple videos are chunked in parallel — each ffmpeg call gets its own thread.
+    chunk_workers = max(1, min(args.chunk_workers, len(selected_videos)))
+    logger.info(
+        "Phase A1 | Chunking all %d video(s) with %d worker(s)...",
+        len(selected_videos),
+        chunk_workers,
+    )
+    pending: List[Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]] = []
+
+    def _chunk_worker(video_info: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], float]:
+        vp = Path(video_info["path"])
+        logger.info("Phase A1 | Chunking: %s", vp.name)
+        return split_video_into_chunks(vp, chunk_root, args.chunk_sec, logger)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=chunk_workers) as executor:
+        future_to_video = {executor.submit(_chunk_worker, vi): vi for vi in selected_videos}
+        for future in concurrent.futures.as_completed(future_to_video):
+            video_info = future_to_video[future]
+            video_path = Path(video_info["path"])
+            video_record = build_video_record(video_path=video_path, task=video_info["task"])
+            try:
+                chunk_records, total_duration = future.result()
+                video_record["total_duration"] = round(total_duration, 3)
+                video_record["total_chunks"] = len(chunk_records)
+                pending.append((video_info, video_record, chunk_records))
+                logger.info("Phase A1 | Done: %s (%d clips)", video_path.name, len(chunk_records))
+            except Exception as exc:
+                logger.exception("Chunking failed for %s", video_path.name)
+                failure = {
+                    "source_video": str(video_path.resolve()),
+                    "task": video_info["task"],
+                    "chunk_index": None,
+                    "chunk_path": None,
+                    "start_time": None,
+                    "end_time": None,
+                    "duration": None,
+                    "error_message": f"chunking_failed: {exc}",
+                }
+                results["failed_chunks"].append(failure)
+                video_record["error"] = failure["error_message"]
+                results["videos"].append(video_record)
+                save_progress(results, results_json_path, failed_chunks_path)
+
+    if not pending:
+        logger.warning("Phase A1 | No videos were successfully chunked.")
+        return results
+
+    total_chunks = sum(len(chunk_records) for _, _, chunk_records in pending)
+    logger.info(
+        "Phase A1 | Done. %d video(s) chunked into %d total clips.",
+        len(pending),
+        total_chunks,
+    )
+
+    # Pass 2: load model once, then infer all chunks without interruption.
+    logger.info("Phase A2 | Loading model...")
     ensure_ml_dependencies()
     model, processor, model_info = load_model_and_processor(
         base_model=args.base_model,
@@ -1427,41 +1486,15 @@ def run_inference_phase(
         logger=logger,
     )
     results["run"] = build_run_metadata(args, prompts, model_info)
-    results["videos"] = []
-    results.setdefault("failed_chunks", [])
+    logger.info("Phase A2 | Inferring %d clips across %d video(s)...", total_chunks, len(pending))
 
-    for video_info in selected_videos:
+    for video_info, video_record, chunk_records in pending:
         video_path = Path(video_info["path"])
-        logger.info("Phase A | Processing video: %s", video_path.name)
-
-        video_record = build_video_record(video_path=video_path, task=video_info["task"])
-
-        try:
-            chunk_records, total_duration = split_video_into_chunks(
-                video_path=video_path,
-                chunk_root=chunk_root,
-                chunk_sec=args.chunk_sec,
-                logger=logger,
-            )
-            video_record["total_duration"] = round(total_duration, 3)
-            video_record["total_chunks"] = len(chunk_records)
-        except Exception as exc:
-            logger.exception("Chunking failed for %s", video_path.name)
-            failure = {
-                "source_video": str(video_path.resolve()),
-                "task": video_info["task"],
-                "chunk_index": None,
-                "chunk_path": None,
-                "start_time": None,
-                "end_time": None,
-                "duration": None,
-                "error_message": f"chunking_failed: {exc}",
-            }
-            results["failed_chunks"].append(failure)
-            video_record["error"] = failure["error_message"]
-            results["videos"].append(video_record)
-            save_progress(results, results_json_path, failed_chunks_path)
-            continue
+        logger.info(
+            "Phase A2 | Inferring %d clip(s) for: %s",
+            len(chunk_records),
+            video_path.name,
+        )
 
         for chunk_meta in chunk_records:
             chunk_path = Path(chunk_meta["chunk_path"])
