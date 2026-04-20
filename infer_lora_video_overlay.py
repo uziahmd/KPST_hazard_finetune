@@ -159,6 +159,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--chunk_sec", type=float, default=5.0, help="Chunk length in seconds.")
     parser.add_argument("--num_frames", type=int, default=12, help="Frames sampled per chunk by the processor.")
+    parser.add_argument(
+        "--video_longest_edge",
+        type=int,
+        default=560,
+        help="Resize videos before tokenization so the longest edge matches this value.",
+    )
+    parser.add_argument(
+        "--video_shortest_edge",
+        type=int,
+        default=308,
+        help="Resize videos before tokenization so the shortest edge matches this value.",
+    )
     parser.add_argument("--max_new_tokens", type=int, default=256, help="Maximum generated tokens per chunk.")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature.")
     parser.add_argument(
@@ -226,6 +238,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Pass trust_remote_code through to Transformers model and processor loading.",
+    )
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="",
+        help="Optional Transformers attention backend override, e.g. eager or sdpa.",
     )
     return parser.parse_args()
 
@@ -571,20 +589,41 @@ def load_model_and_processor(
     adapter_dir: str,
     device_arg: str,
     trust_remote_code: bool,
+    attn_implementation: str,
+    video_longest_edge: int,
+    video_shortest_edge: int,
     logger: logging.Logger,
 ) -> Tuple[torch.nn.Module, Any, Dict[str, Any]]:
     dtype = select_dtype(normalize_device_arg(device_arg))
     logger.info("Loading processor from %s", base_model)
     processor = AutoProcessor.from_pretrained(base_model, trust_remote_code=trust_remote_code)
+    if (
+        video_longest_edge > 0
+        and video_shortest_edge > 0
+        and hasattr(processor, "video_processor")
+        and hasattr(processor.video_processor, "size")
+    ):
+        processor.video_processor.size = {
+            "longest_edge": video_longest_edge,
+            "shortest_edge": video_shortest_edge,
+        }
+        logger.info("Configured processor.video_processor.size=%s", processor.video_processor.size)
 
     model_kwargs: Dict[str, Any] = {
         "trust_remote_code": trust_remote_code,
         "low_cpu_mem_usage": True,
         "torch_dtype": dtype,
     }
+    if attn_implementation:
+        model_kwargs["attn_implementation"] = attn_implementation
 
     normalized_device = normalize_device_arg(device_arg)
-    if device_arg == "auto" and torch.cuda.is_available():
+    use_auto_device_map = (
+        device_arg == "auto"
+        and normalized_device == "cuda"
+        and torch.cuda.device_count() > 1
+    )
+    if use_auto_device_map:
         model_kwargs["device_map"] = "auto"
 
     model_candidates = []
@@ -606,7 +645,7 @@ def load_model_and_processor(
     if base_model_obj is None:
         raise RuntimeError("Unable to load base model. Errors:\n" + "\n".join(load_errors))
 
-    if device_arg != "auto":
+    if not use_auto_device_map:
         base_model_obj = base_model_obj.to(torch.device(normalized_device))
 
     logger.info("Applying adapter from %s", adapter_dir)
@@ -625,6 +664,9 @@ def load_model_and_processor(
         "base_model": base_model,
         "adapter_dir": str(Path(adapter_dir).resolve()),
         "hf_device_map": getattr(model, "hf_device_map", None),
+        "attn_implementation": attn_implementation or None,
+        "processor_video_size": getattr(getattr(processor, "video_processor", None), "size", None),
+        "used_device_map_auto": use_auto_device_map,
     }
     return model, processor, model_info
 
@@ -1261,9 +1303,12 @@ def build_run_metadata(
         "chunk_sec": args.chunk_sec,
         "generation": {
             "num_frames": args.num_frames,
+            "video_longest_edge": args.video_longest_edge,
+            "video_shortest_edge": args.video_shortest_edge,
             "max_new_tokens": args.max_new_tokens,
             "temperature": args.temperature,
             "do_sample": args.do_sample,
+            "attn_implementation": args.attn_implementation or None,
         },
         "model_info": model_info,
     }
@@ -1299,9 +1344,12 @@ def build_empty_results(
             "chunk_sec": args.chunk_sec,
             "generation": {
                 "num_frames": args.num_frames,
+                "video_longest_edge": args.video_longest_edge,
+                "video_shortest_edge": args.video_shortest_edge,
                 "max_new_tokens": args.max_new_tokens,
                 "temperature": args.temperature,
                 "do_sample": args.do_sample,
+                "attn_implementation": args.attn_implementation or None,
             },
             "model_info": model_info,
         },
@@ -1483,6 +1531,9 @@ def run_inference_phase(
         adapter_dir=args.adapter_dir,
         device_arg=args.device,
         trust_remote_code=args.trust_remote_code,
+        attn_implementation=args.attn_implementation,
+        video_longest_edge=args.video_longest_edge,
+        video_shortest_edge=args.video_shortest_edge,
         logger=logger,
     )
     results["run"] = build_run_metadata(args, prompts, model_info)

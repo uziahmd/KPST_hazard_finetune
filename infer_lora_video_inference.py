@@ -51,6 +51,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--chunk_sec", type=float, default=5.0, help="Chunk length in seconds.")
     parser.add_argument("--num_frames", type=int, default=12, help="Frames sampled per chunk by the processor.")
+    parser.add_argument(
+        "--video_longest_edge",
+        type=int,
+        default=560,
+        help="Resize videos before tokenization so the longest edge matches this value.",
+    )
+    parser.add_argument(
+        "--video_shortest_edge",
+        type=int,
+        default=308,
+        help="Resize videos before tokenization so the shortest edge matches this value.",
+    )
     parser.add_argument("--max_new_tokens", type=int, default=256, help="Maximum generated tokens per chunk.")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature.")
     parser.add_argument(
@@ -89,6 +101,12 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Pass trust_remote_code through to Transformers model and processor loading.",
     )
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="",
+        help="Optional Transformers attention backend override, e.g. eager or sdpa.",
+    )
     return parser.parse_args()
 
 
@@ -105,6 +123,8 @@ def main() -> None:
             fork_prompt_file=args.fork_prompt_file,
             chunk_sec=args.chunk_sec,
             num_frames=args.num_frames,
+            video_longest_edge=args.video_longest_edge,
+            video_shortest_edge=args.video_shortest_edge,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             do_sample=args.do_sample,
@@ -118,6 +138,7 @@ def main() -> None:
             skip_overlay=True,
             results_json=args.results_json,
             trust_remote_code=args.trust_remote_code,
+            attn_implementation=args.attn_implementation,
         )
     )
 
