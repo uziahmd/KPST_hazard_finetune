@@ -90,6 +90,8 @@ def main() -> None:
             fork_prompt_file="prompts/fork_prompt_v2.txt",
             chunk_sec=5.0,
             num_frames=12,
+            video_longest_edge=560,
+            video_shortest_edge=308,
             max_new_tokens=256,
             temperature=0.0,
             do_sample=False,
@@ -97,11 +99,13 @@ def main() -> None:
             save_chunks=True,
             save_overlay=args.save_overlay,
             font_file=args.font_file,
+            chunk_workers=1,
             overlay_workers=args.overlay_workers,
             skip_inference=True,
             skip_overlay=False,
             results_json=str(results_json),
             trust_remote_code=True,
+            attn_implementation="",
         )
     )
 

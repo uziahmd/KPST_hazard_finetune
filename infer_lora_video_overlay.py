@@ -502,12 +502,16 @@ def split_video_into_chunks(
     # timestamp convention the rest of the pipeline expects.
     # +faststart is intentionally omitted — these clips are only read locally
     # for frame extraction so the moov-atom rewrite pass is wasted work.
+    # Force keyframes on the requested chunk boundaries so the segment muxer can
+    # actually cut there. Without this, ffmpeg will often wait for the next
+    # natural keyframe and produce far fewer, much longer chunks.
     seg_pattern = str(video_chunk_dir / "seg_%04d.mp4")
     cmd = [
         "ffmpeg", "-y", "-nostdin", "-v", "error",
         "-i", str(video_path),
         "-map", "0:v:0", "-map", "0:a?",
         "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
+        "-force_key_frames", f"expr:gte(t,n_forced*{chunk_sec:.6f})",
         "-c:a", "aac", "-b:a", "128k",
         "-f", "segment",
         "-segment_time", f"{chunk_sec:.3f}",
@@ -523,9 +527,14 @@ def split_video_into_chunks(
         raise RuntimeError(f"ffmpeg segmentation produced no output files for {video_path.name}")
 
     chunks: List[Dict[str, Any]] = []
+    running_start = 0.0
     for chunk_index, tmp_path in enumerate(tmp_segs):
-        start_sec = chunk_index * chunk_sec
-        end_sec = min(duration, start_sec + chunk_sec)
+        probed_duration = ffprobe_duration(tmp_path)
+        if chunk_index == len(tmp_segs) - 1:
+            end_sec = duration
+        else:
+            end_sec = min(duration, running_start + probed_duration)
+        start_sec = min(running_start, duration)
         part_duration = max(0.0, end_sec - start_sec)
         if part_duration <= 0:
             tmp_path.unlink(missing_ok=True)
@@ -534,6 +543,15 @@ def split_video_into_chunks(
         chunk_name = f"{video_path.stem}__{format_time_token(start_sec)}_{format_time_token(end_sec)}.mp4"
         chunk_path = video_chunk_dir / chunk_name
         tmp_path.rename(chunk_path)
+
+        if abs(part_duration - chunk_sec) > 0.25 and chunk_index != len(tmp_segs) - 1:
+            logger.warning(
+                "Chunk duration drift for %s segment %d: expected %.3fs, got %.3fs",
+                video_path.name,
+                chunk_index,
+                chunk_sec,
+                part_duration,
+            )
 
         chunks.append({
             "original_video_path": str(video_path.resolve()),
@@ -545,6 +563,7 @@ def split_video_into_chunks(
             "duration": round(part_duration, 3),
             "chunk_path": str(chunk_path.resolve()),
         })
+        running_start = end_sec
 
     return chunks, duration
 
