@@ -1,0 +1,9 @@
+model,task,source_file,field,accuracy,macro_f1,weighted_f1,num_scored_samples
+Robot-only,robot,checkpoint-414.json,hazard_label,0.9617,0.914,0.9603,627
+Robot-only,robot,checkpoint-414.json,hazard_present,0.9617,0.914,0.9603,627
+Robot-only,robot,checkpoint-414.json,zone_relation,0.9904,0.9458,0.9903,627
+Robot-only,robot,checkpoint-414.json,object_state,0.9713,0.904,0.9698,627
+Both-tasks,robot,checkpoint-531.json,hazard_label,0.9392,0.8302,0.9341,609
+Both-tasks,robot,checkpoint-531.json,hazard_present,0.9392,0.8302,0.9341,609
+Both-tasks,robot,checkpoint-531.json,zone_relation,0.9688,0.8308,0.967,609
+Both-tasks,robot,checkpoint-531.json,object_state,0.9622,0.8184,0.9577,609

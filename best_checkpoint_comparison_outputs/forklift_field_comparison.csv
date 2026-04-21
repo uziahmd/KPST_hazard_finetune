@@ -1,0 +1,11 @@
+model,task,source_file,field,accuracy,macro_f1,weighted_f1,num_scored_samples
+Forklift-only,forklift,final.json,hazard_label,0.945,0.8804,0.9446,200
+Forklift-only,forklift,final.json,hazard_present,0.945,0.8804,0.9446,200
+Forklift-only,forklift,final.json,zone_relation,0.785,0.7204,0.8137,200
+Forklift-only,forklift,final.json,object_state,0.81,0.8231,0.8164,200
+Forklift-only,forklift,final.json,object_direction,0.795,0.7254,0.8145,200
+Both-tasks,forklift,checkpoint-531.json,hazard_label,0.945,0.8674,0.9414,200
+Both-tasks,forklift,checkpoint-531.json,hazard_present,0.945,0.8674,0.9414,200
+Both-tasks,forklift,checkpoint-531.json,zone_relation,0.95,0.8955,0.9529,200
+Both-tasks,forklift,checkpoint-531.json,object_state,0.98,0.9825,0.9801,200
+Both-tasks,forklift,checkpoint-531.json,object_direction,0.93,0.8462,0.9322,200

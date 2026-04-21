@@ -1,0 +1,3 @@
+model,task,source_file,total_samples,exact_match_accuracy,relevant_field_accuracy,parse_failures,ground_truth_parse_failures,hazard_precision,hazard_recall,hazard_f1,hazard_fp_count,hazard_fp_rate
+Forklift-only,forklift,final.json,200,0.76,0.856,0,0,0.8077,0.7778,0.7925,5,0.028901734104046242
+Both-tasks,forklift,checkpoint-531.json,200,0.91,0.95,0,0,0.9,0.6667,0.766,2,0.011560693641618497

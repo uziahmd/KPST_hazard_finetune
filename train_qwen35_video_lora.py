@@ -38,13 +38,12 @@ Expected row format:
 }
 
 RUN
-
 python train_qwen35_video_lora.py \
-  --train_file vlm_dataset_both_aug/train_chat.jsonl \
-  --val_file   vlm_dataset_both_aug/val_chat.jsonl \
-  --test_file  vlm_dataset_both_aug/test_chat.jsonl \
+  --train_file vlm_dataset_robot_aug/train_chat.jsonl \
+  --val_file   vlm_dataset_robot_aug/val_chat.jsonl \
+  --test_file  vlm_dataset_robot_aug/test_chat.jsonl \
   --model_name_or_path Qwen/Qwen3.5-9B \
-  --output_dir runs/qwen35_9b_both_aug_2 \
+  --output_dir runs/qwen35_9b_robot_aug_all \
   --num_frames 12 \
   --per_device_train_batch_size 4 \
   --gradient_accumulation_steps 16 \
@@ -55,7 +54,7 @@ python train_qwen35_video_lora.py \
   --lora_r 32 \
   --lora_alpha 64 \
   --lora_dropout 0.05 \
-  --lora_target_modules "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
+  --lora_target_modules "all-linear" \
   --gradient_checkpointing \
   --use_fp16 \
   --eval_strategy epoch \
@@ -63,8 +62,8 @@ python train_qwen35_video_lora.py \
   --save_total_limit 9 \
   --attn_implementation sdpa \
   --seed 3407 \
-  --pause_on_interrupt \
-  --resume_from_checkpoint last
+  --pause_on_interrupt
+
 """
 
 import argparse

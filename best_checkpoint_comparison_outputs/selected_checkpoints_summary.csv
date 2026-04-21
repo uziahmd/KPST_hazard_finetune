@@ -1,0 +1,5 @@
+comparison,experiment_label,task,file_name,file_path,exact_match_accuracy,relevant_field_accuracy
+forklift_specific_best,Forklift-only,forklift,final.json,runs/qwen35_9b_v3/eval_results/final.json,0.76,0.856
+both_best_on_forklift,Both-tasks,forklift,checkpoint-531.json,runs/qwen35_9b_both_aug_2/eval_results/checkpoint-531.json,0.91,0.95
+robot_specific_best,Robot-only,robot,checkpoint-414.json,runs/qwen35_9b_robot_aug_all/eval_results/checkpoint-414.json,0.9617,0.9713
+both_best_on_robot,Both-tasks,robot,checkpoint-531.json,runs/qwen35_9b_both_aug_2/eval_results/checkpoint-531.json,0.936,0.9524

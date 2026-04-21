@@ -1,0 +1,3 @@
+model,task,source_file,total_samples,exact_match_accuracy,relevant_field_accuracy,parse_failures,ground_truth_parse_failures,hazard_precision,hazard_recall,hazard_f1,hazard_fp_count,hazard_fp_rate
+Robot-only,robot,checkpoint-414.json,627,0.9617,0.9713,0,0,0.9657,0.9907,0.9781,19,0.21839080459770116
+Both-tasks,robot,checkpoint-531.json,609,0.936,0.9524,0,0,0.9464,0.987,0.9663,30,0.4166666666666667
